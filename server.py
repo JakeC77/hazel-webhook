@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hazel Dashboard Chat Webhook — OpenClaw shim (v5, new-project-setup)
+Hazel Dashboard Chat Webhook — OpenClaw shim (v6, epic-1-account-identity)
 
 Receives Supabase INSERT events on the messages table (builder role only)
 and forwards them to the OpenClaw hooks API targeting the hazel agent.
@@ -11,27 +11,95 @@ Special triggers:
 
 Port: 8700
 """
-import os, json, logging, requests, threading
-from flask import Flask, request, jsonify
+import os, json, logging, requests, threading, uuid
+from functools import wraps
+from flask import Flask, request, jsonify, g
+
+import jwt  # PyJWT
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-WEBHOOK_SECRET  = os.getenv("HAZEL_WEBHOOK_SECRET", "hazel-chat-2026")
-OPENCLAW_URL    = os.getenv("OPENCLAW_API_URL", "http://127.0.0.1:18789")
-HOOKS_TOKEN     = os.getenv("OPENCLAW_HOOKS_TOKEN", "")
-SUPABASE_URL    = "https://zrolyrtaaaiauigrvusl.supabase.co"
-SUPABASE_KEY    = os.getenv("SUPABASE_SERVICE_KEY", "")
-SB_HEADERS      = {
+WEBHOOK_SECRET      = os.getenv("HAZEL_WEBHOOK_SECRET", "hazel-chat-2026")
+OPENCLAW_URL        = os.getenv("OPENCLAW_API_URL", "http://127.0.0.1:18789")
+HOOKS_TOKEN         = os.getenv("OPENCLAW_HOOKS_TOKEN", "")
+SUPABASE_URL        = "https://zrolyrtaaaiauigrvusl.supabase.co"
+SUPABASE_KEY        = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+SB_HEADERS          = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
 }
 
-HOME_PROJECT_ID  = "a0000000-0000-0000-0000-000000000000"
-SETUP_TRIGGER    = "[NEW_PROJECT_SETUP]"
+HOME_PROJECT_ID = "a0000000-0000-0000-0000-000000000000"
+SETUP_TRIGGER   = "[NEW_PROJECT_SETUP]"
 
 _seen = set()
 _seen_lock = threading.Lock()
+
+
+# ── JWT AUTH MIDDLEWARE ────────────────────────────────────────────────────────
+
+def get_firm_id_for_user(user_id: str):
+    """Look up the firm_id for a given user_id via Supabase service role."""
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"user_id": f"eq.{user_id}", "select": "firm_id", "limit": "1"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data:
+            return data[0]["firm_id"]
+    except Exception as e:
+        logging.warning(f"get_firm_id_for_user({user_id}): {e}")
+    return None
+
+
+def require_auth(f):
+    """
+    Decorator that validates the Supabase JWT Bearer token on incoming requests.
+    Sets g.user_id and g.firm_id for use in route handlers.
+    Returns 401 if missing or invalid.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Missing or invalid Authorization header"}), 401
+
+        token = auth_header[len("Bearer "):]
+        if not SUPABASE_JWT_SECRET:
+            logging.error("SUPABASE_JWT_SECRET is not set — cannot validate JWT")
+            return jsonify({"error": "Server misconfiguration: JWT secret not set"}), 500
+
+        try:
+            # Supabase JWTs use HS256; 'sub' contains the user UUID
+            payload = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                options={"require": ["sub", "exp"]},
+            )
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except jwt.InvalidTokenError as e:
+            logging.warning(f"JWT validation failed: {e}")
+            return jsonify({"error": "Invalid token"}), 401
+
+        user_id = payload.get("sub")
+        if not user_id:
+            return jsonify({"error": "No user_id in token"}), 401
+
+        g.user_id = user_id
+        g.firm_id = get_firm_id_for_user(user_id)
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ── HELPERS (unchanged from v5) ───────────────────────────────────────────────
 
 def already_seen(msg_id):
     with _seen_lock:
@@ -171,7 +239,6 @@ def forward_home(content, msg_id):
         logging.exception(f"Failed to forward home message {msg_id} to hazel")
 
 def forward_setup(project_id, msg_id):
-    """Handle [NEW_PROJECT_SETUP] trigger — start a fresh project setup session."""
     try:
         session_key = f"hook:hazel:dashboard:{project_id}"
         message = (
@@ -209,21 +276,17 @@ def forward_to_hazel(project_id, content, msg_id, message_attachments):
     if project_id == HOME_PROJECT_ID:
         forward_home(content, msg_id)
         return
-
     if content.strip() == SETUP_TRIGGER:
         forward_setup(project_id, msg_id)
         return
-
     try:
-        info = get_project_info(project_id)
+        info         = get_project_info(project_id)
         project_name = info["name"]
         pm_name      = info["pm_name"]
         graph_id     = info["graph_project_id"]
-
-        session_key = f"hook:hazel:dashboard:{project_id}"
-        graph_line  = f"Graph Project ID: {graph_id}" if graph_id else "Graph Project ID: (not linked — query by project name)"
+        session_key  = f"hook:hazel:dashboard:{project_id}"
+        graph_line   = f"Graph Project ID: {graph_id}" if graph_id else "Graph Project ID: (not linked — query by project name)"
         file_context = build_file_context(project_id, message_attachments)
-
         message = (
             f"[Dashboard message from {pm_name} — {project_name}]\n"
             f"Supabase Project ID: {project_id}\n"
@@ -232,124 +295,284 @@ def forward_to_hazel(project_id, content, msg_id, message_attachments):
         if file_context:
             message += file_context + "\n"
         message += content
-
         post_to_hazel(session_key, message)
         logging.info(f"Forwarded to hazel ({project_id[:8]}): {content[:80]}")
-
     except Exception:
         logging.exception(f"Failed to forward message {msg_id} to hazel")
+
+
+# ── WEBHOOK ROUTES (secret-based auth, unchanged) ─────────────────────────────
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "service": "hazel-chat-webhook", "version": "6.0-epic-1"}), 200
 
 @app.route("/webhook/chat", methods=["POST"])
 def webhook_chat():
     secret = request.headers.get("X-Webhook-Secret") or request.args.get("secret")
     if secret != WEBHOOK_SECRET:
         return jsonify({"error": "unauthorized"}), 401
-
-    payload = request.get_json(force=True) or {}
-    record = payload.get("record") or payload.get("new") or payload
-
+    payload    = request.get_json(force=True) or {}
+    record     = payload.get("record") or payload.get("new") or payload
     if record.get("role") != "builder":
         return jsonify({"status": "skipped"}), 200
-
     content     = (record.get("content") or "").strip()
     project_id  = record.get("project_id")
     msg_id      = record.get("id", "")
     attachments = record.get("attachments") or []
-
     if not content and not attachments:
         return jsonify({"error": "missing content"}), 400
     if not project_id:
         return jsonify({"error": "missing project_id"}), 400
-
     if already_seen(msg_id):
         logging.info(f"Duplicate webhook {msg_id} — skipping")
         return jsonify({"status": "duplicate"}), 200
-
     logging.info(f"Chat ({project_id[:8]}): {content[:80]}{' [+files]' if attachments else ''}")
-
     t = threading.Thread(target=forward_to_hazel, args=(project_id, content, msg_id, attachments), daemon=True)
     t.start()
-
     return jsonify({"status": "queued"}), 200
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "service": "hazel-chat-webhook", "version": "5.0-new-project-setup"}), 200
-
-
-AGENTMAIL_KEY  = os.getenv("AGENTMAIL_KEY", "")
-HAZEL_INBOX    = "itshazel@agentmail.to"
-
+AGENTMAIL_KEY = os.getenv("AGENTMAIL_KEY", "")
+HAZEL_INBOX   = "itshazel@agentmail.to"
 
 def get_email_field(data, *keys):
-    """Try multiple key names — handles flat and nested payloads."""
     for k in keys:
         if k in data:
             return data[k]
     return None
 
-
 @app.route("/webhook/email", methods=["POST"])
 def webhook_email():
-    """
-    AgentMail webhook — fires on message.received for itshazel@agentmail.to.
-    Forwards incoming emails to Hazel via OpenClaw hooks.
-    """
-    payload = request.get_json(force=True) or {}
-
-    # AgentMail/Svix payload: {event_id, event_type, message: {...}}
-    data = payload.get("message") or payload.get("data") or payload
-
+    payload    = request.get_json(force=True) or {}
+    data       = payload.get("message") or payload.get("data") or payload
     event_type = payload.get("event_type") or payload.get("type", "message.received")
     if "message" not in event_type:
         return jsonify({"status": "ignored", "event_type": event_type}), 200
-
     thread_id  = get_email_field(data, "thread_id", "threadId")
     message_id = get_email_field(data, "message_id", "messageId", "id")
     sender     = get_email_field(data, "from", "sender", "from_address") or "unknown"
     subject    = get_email_field(data, "subject") or "(no subject)"
     body       = (
         get_email_field(data, "extracted_text", "text", "preview")
-        or get_email_field(data, "html")
-        or ""
+        or get_email_field(data, "html") or ""
     ).strip()
-
     if not thread_id:
         logging.warning(f"Email webhook: no thread_id in payload: {json.dumps(payload)[:200]}")
         return jsonify({"error": "missing thread_id"}), 400
-
     dedup_key = message_id or thread_id
     if already_seen(dedup_key):
         logging.info(f"Duplicate email webhook {dedup_key} — skipping")
         return jsonify({"status": "duplicate"}), 200
-
     session_key = f"hook:hazel:email:{thread_id}"
     message = (
-        f"[Incoming email]\n"
-        f"From: {sender}\n"
-        f"Subject: {subject}\n"
-        f"Thread ID: {thread_id}\n"
-        f"Message ID: {message_id}\n"
-        f"\n--- Message ---\n"
-        f"{body}\n"
+        f"[Incoming email]\nFrom: {sender}\nSubject: {subject}\n"
+        f"Thread ID: {thread_id}\nMessage ID: {message_id}\n"
+        f"\n--- Message ---\n{body}\n"
         f"\n--- Reply instructions ---\n"
-        f"To reply:\n"
-        f"  python3 skills/boh-dashboard/scripts/send_email.py \\\n"
-        f"    --thread-id {thread_id} \\\n"
-        f"    --to \"{sender}\" \\\n"
-        f"    --subject \"Re: {subject}\" \\\n"
-        f"    --text \"your reply here\"\n"
-        f"\nTo start a new email:\n"
-        f"  python3 skills/boh-dashboard/scripts/send_email.py \\\n"
+        f"To reply:\n  python3 skills/boh-dashboard/scripts/send_email.py \\\n"
+        f"    --thread-id {thread_id} \\\n    --to \"{sender}\" \\\n"
+        f"    --subject \"Re: {subject}\" \\\n    --text \"your reply here\"\n"
+        f"\nTo start a new email:\n  python3 skills/boh-dashboard/scripts/send_email.py \\\n"
         f"    --to \"recipient@example.com\" --subject \"Subject\" --text \"body\"\n"
     )
-
     logging.info(f"Email from {sender} | thread={thread_id[:12]} | {subject[:60]}")
-
     t = threading.Thread(target=lambda: post_to_hazel(session_key, message), daemon=True)
     t.start()
-
     return jsonify({"status": "queued"}), 200
+
+
+# ── PROTECTED API ROUTES (JWT required via @require_auth) ─────────────────────
+
+@app.route("/api/firm-context", methods=["GET"])
+@require_auth
+def api_firm_context():
+    """Returns firm profile for Hazel system prompt injection. AC-03."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}", "select": "*", "limit": "1"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return jsonify({"error": "Firm not found"}), 404
+        return jsonify(data[0]), 200
+    except Exception as e:
+        logging.error(f"api_firm_context: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/team", methods=["GET"])
+@require_auth
+def api_team():
+    """Returns members + pending invites for the caller's firm. AC-06."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    try:
+        members_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "select": "id,user_id,role,created_at", "order": "created_at.asc"},
+            timeout=5,
+        )
+        members_r.raise_for_status()
+        members = members_r.json()
+
+        invites_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/invite_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "used_at": "is.null", "select": "id,email,created_at,expires_at", "order": "created_at.desc"},
+            timeout=5,
+        )
+        invites_r.raise_for_status()
+        pending_invites = invites_r.json()
+
+        # Enrich with email from auth.users
+        user_emails = {}
+        for m in members:
+            uid = m["user_id"]
+            try:
+                u_r = requests.get(
+                    f"{SUPABASE_URL}/auth/v1/admin/users/{uid}",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    timeout=5,
+                )
+                if u_r.ok:
+                    user_emails[uid] = u_r.json().get("email", "")
+            except Exception:
+                pass
+
+        members_out = [
+            {"id": m["id"], "user_id": m["user_id"], "email": user_emails.get(m["user_id"], ""),
+             "role": m["role"], "created_at": m["created_at"]}
+            for m in members
+        ]
+        return jsonify({"members": members_out, "pending_invites": pending_invites}), 200
+    except Exception as e:
+        logging.error(f"api_team: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/invites", methods=["POST"])
+@require_auth
+def api_invites():
+    """Creates invite token + sends Supabase Auth invite email. Owners only. AC-06."""
+    user_id = g.user_id
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+
+    body  = request.get_json(force=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "email is required"}), 400
+
+    # Verify caller is owner
+    try:
+        role_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{user_id}", "select": "role", "limit": "1"},
+            timeout=5,
+        )
+        role_r.raise_for_status()
+        role_data = role_r.json()
+        if not role_data or role_data[0].get("role") != "owner":
+            return jsonify({"error": "Only firm owners can send invites"}), 403
+    except Exception as e:
+        logging.error(f"api_invites role check: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+    # Create invite token record
+    token = str(uuid.uuid4())
+    try:
+        inv_r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/invite_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={"firm_id": firm_id, "email": email, "token": token, "invited_by": user_id},
+            timeout=5,
+        )
+        inv_r.raise_for_status()
+    except Exception as e:
+        logging.error(f"api_invites create token: {e}")
+        return jsonify({"error": "Failed to create invite"}), 500
+
+    # Send via Supabase Admin invite
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/auth/v1/invite",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
+            json={"email": email, "data": {"invite_token": token, "firm_id": firm_id}},
+            timeout=10,
+        )
+    except Exception as e:
+        logging.warning(f"api_invites send email (non-fatal): {e}")
+
+    logging.info(f"Invite sent to {email} for firm {firm_id[:8]}")
+    return jsonify({"status": "invited", "token": token, "email": email}), 201
+
+
+@app.route("/api/invites/accept", methods=["POST"])
+@require_auth
+def api_invites_accept():
+    """Validates invite token, adds user to firm as member. AC-06."""
+    from datetime import datetime, timezone
+    user_id = g.user_id
+    body    = request.get_json(force=True) or {}
+    token   = (body.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token is required"}), 400
+    try:
+        tok_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/invite_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"token": f"eq.{token}", "select": "*", "limit": "1"},
+            timeout=5,
+        )
+        tok_r.raise_for_status()
+        tok_data = tok_r.json()
+        if not tok_data:
+            return jsonify({"error": "Invalid invite token"}), 404
+        invite = tok_data[0]
+        if invite.get("used_at"):
+            return jsonify({"error": "Invite token already used"}), 410
+        expires_at = invite.get("expires_at")
+        if expires_at:
+            exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > exp_dt:
+                return jsonify({"error": "Invite token has expired"}), 410
+        firm_id = invite["firm_id"]
+
+        # Add to firm (ignore duplicate)
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "return=representation,resolution=ignore-duplicates"},
+            json={"firm_id": firm_id, "user_id": user_id, "role": "member",
+                  "invited_by": invite.get("invited_by")},
+            timeout=5,
+        )
+
+        # Mark token used
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/invite_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{invite['id']}"},
+            json={"used_at": datetime.now(timezone.utc).isoformat()},
+            timeout=5,
+        )
+
+        logging.info(f"Invite accepted: user {user_id[:8]} joined firm {firm_id[:8]}")
+        return jsonify({"status": "accepted", "firm_id": firm_id}), 200
+    except Exception as e:
+        logging.error(f"api_invites_accept: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 
 if __name__ == "__main__":
