@@ -1,0 +1,15 @@
+[Unit]
+Description=Hazel Dashboard Chat Webhook
+After=network.target
+
+[Service]
+Type=simple
+User=openclaw
+WorkingDirectory=/home/openclaw/hazel-chat-webhook
+ExecStart=/home/openclaw/hazel-chat-webhook/venv/bin/python server.py
+Restart=always
+RestartSec=5
+Environment=HAZEL_WEBHOOK_SECRET=hazel-chat-2026
+
+[Install]
+WantedBy=multi-user.target
