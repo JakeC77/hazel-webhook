@@ -590,14 +590,26 @@ def api_invites():
         logging.error(f"api_invites create token: {e}")
         return jsonify({"error": "Failed to create invite"}), 500
 
-    # Send via Supabase Admin invite
+    # Send invite email via AgentMail (bypasses Supabase's 3/hr rate limit)
+    invite_url = f"https://hazel.haventechsolutions.com/?invite_token={token}"
     try:
-        requests.post(
-            f"{SUPABASE_URL}/auth/v1/invite",
-            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
-            json={"email": email, "data": {"invite_token": token, "firm_id": firm_id}},
+        if not AGENTMAIL_KEY:
+            raise ValueError("AGENTMAIL_KEY not set")
+        mail_r = requests.post(
+            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
+            json={
+                "to": [email],
+                "subject": "You've been invited to Hazel",
+                "text": f"You've been invited to join a firm on Hazel.\n\nAccept your invite:\n{invite_url}\n\nThis link expires in 72 hours.",
+                "html": f"""<p>You've been invited to join a firm on <strong>Hazel</strong>.</p>
+<p><a href="{invite_url}" style="background:#1e3a5f;color:white;padding:10px 20px;text-decoration:none;border-radius:6px;display:inline-block;margin:8px 0;">Accept Invite</a></p>
+<p style="color:#666;font-size:13px;">This link expires in 72 hours. If you didn't expect this, ignore this email.</p>""",
+            },
             timeout=10,
         )
+        if not mail_r.ok:
+            logging.warning(f"api_invites AgentMail error {mail_r.status_code}: {mail_r.text[:200]}")
     except Exception as e:
         logging.warning(f"api_invites send email (non-fatal): {e}")
 
