@@ -15,7 +15,8 @@ import os, json, logging, requests, threading, uuid
 from functools import wraps
 from flask import Flask, request, jsonify, g
 
-import jwt  # PyJWT
+import jwt
+from jwt import PyJWKClient  # PyJWT
 
 app = Flask(__name__)
 
@@ -47,6 +48,13 @@ HOOKS_TOKEN         = os.getenv("OPENCLAW_HOOKS_TOKEN", "")
 SUPABASE_URL        = "https://zrolyrtaaaiauigrvusl.supabase.co"
 SUPABASE_KEY        = os.getenv("SUPABASE_SERVICE_KEY", "")
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+
+# JWKS client — fetches Supabase public keys for ES256 JWT verification
+# Supabase switched from HS256 to ES256 on newer projects
+_jwks_client = PyJWKClient(
+    f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json",
+    cache_keys=True,
+)
 SB_HEADERS          = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -97,17 +105,21 @@ def require_auth(f):
             return jsonify({"error": "Server misconfiguration: JWT secret not set"}), 500
 
         try:
-            # Supabase JWTs use HS256; 'sub' contains the user UUID
+            # Supabase uses ES256 (ECDSA P-256) on newer projects — use JWKS
+            signing_key = _jwks_client.get_signing_key_from_jwt(token)
             payload = jwt.decode(
                 token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
+                signing_key.key,
+                algorithms=["ES256", "HS256"],
                 options={"require": ["sub", "exp"]},
             )
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "Token expired"}), 401
         except jwt.InvalidTokenError as e:
             logging.warning(f"JWT validation failed: {e}")
+            return jsonify({"error": "Invalid token"}), 401
+        except Exception as e:
+            logging.warning(f"JWKS lookup failed: {e}")
             return jsonify({"error": "Invalid token"}), 401
 
         user_id = payload.get("sub")
