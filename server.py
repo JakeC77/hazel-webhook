@@ -596,7 +596,7 @@ def api_invites():
         if not AGENTMAIL_KEY:
             raise ValueError("AGENTMAIL_KEY not set")
         mail_r = requests.post(
-            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages",
+            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
             headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
             json={
                 "to": [email],
