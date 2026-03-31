@@ -461,6 +461,7 @@ def api_preferences_put():
         "blackout_days", "blackout_start_time", "blackout_end_time",
         "tone", "custom_phrases", "client_follow_up_days",
         "jurisdictions", "primary_jurisdiction",
+        "daily_digest_enabled",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
     if not patch:
@@ -1004,6 +1005,324 @@ def api_invites_accept():
     except Exception as e:
         logging.error(f"api_invites_accept: {e}")
         return jsonify({"error": "Internal server error"}), 500
+
+
+# ── RL-04: NOTIFICATION HEALTH ─────────────────────────────────────────────────
+
+@app.route("/api/health/notifications", methods=["GET"])
+def health_notifications():
+    """Returns notification delivery health for monitoring (UptimeRobot target).
+    No auth required — designed for external uptime monitors."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+        # Count failed notifications in last 24h by channel
+        sms_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/notification_log",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "count=exact"},
+            params={
+                "channel": "eq.sms",
+                "delivery_status": "eq.failed",
+                "sent_at": f"gte.{cutoff}",
+                "select": "id",
+                "limit": "0",
+            },
+            timeout=5,
+        )
+        sms_failed = int(sms_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+
+        dash_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/notification_log",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "count=exact"},
+            params={
+                "channel": "eq.dashboard",
+                "delivery_status": "eq.failed",
+                "sent_at": f"gte.{cutoff}",
+                "select": "id",
+                "limit": "0",
+            },
+            timeout=5,
+        )
+        dash_failed = int(dash_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+
+        # Last successful SMS
+        last_sms_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/notification_log",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={
+                "channel": "eq.sms",
+                "delivery_status": "eq.sent",
+                "select": "sent_at",
+                "order": "sent_at.desc",
+                "limit": "1",
+            },
+            timeout=5,
+        )
+        last_sms_data = last_sms_r.json()
+        last_sms = last_sms_data[0]["sent_at"] if last_sms_data else None
+
+        result = {
+            "sms_failed_24h": sms_failed,
+            "dashboard_failed_24h": dash_failed,
+            "last_sms_sent_at": last_sms,
+        }
+
+        # Return 500 if too many failures (triggers UptimeRobot alert)
+        if sms_failed > 3 or dash_failed > 3:
+            return jsonify({**result, "status": "degraded"}), 500
+
+        return jsonify({**result, "status": "ok"}), 200
+    except Exception as e:
+        logging.error(f"health_notifications: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+# ── RL-04: NOTIFICATION LOG HELPER ────────────────────────────────────────────
+
+def log_notification(firm_id, channel, payload_summary, delivery_status="sent",
+                     error_code=None, related_entity_type=None, related_entity_id=None):
+    """Write a notification_log entry. Called from digest sender, resurfacer, etc."""
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/notification_log",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json={
+                "firm_id": firm_id,
+                "channel": channel,
+                "payload_summary": payload_summary[:500] if payload_summary else None,
+                "delivery_status": delivery_status,
+                "error_code": error_code,
+                "related_entity_type": related_entity_type,
+                "related_entity_id": related_entity_id,
+            },
+            timeout=5,
+        )
+    except Exception as e:
+        logging.error(f"log_notification failed: {e}")
+
+
+# ── RL-02: DAILY DIGEST GENERATION ────────────────────────────────────────────
+
+@app.route("/api/digest/generate", methods=["POST"])
+def generate_daily_digest():
+    """Called by a cron job (systemd timer or external scheduler) to generate
+    and send daily digests for all firms. Auth via webhook secret."""
+    secret = request.headers.get("X-Webhook-Secret") or request.args.get("secret")
+    if secret != WEBHOOK_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    from datetime import datetime, timezone, timedelta
+    try:
+        # Get all firms with digest enabled
+        prefs_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_preferences",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"daily_digest_enabled": "eq.true", "select": "firm_id"},
+            timeout=5,
+        )
+        firm_ids = [p["firm_id"] for p in prefs_r.json()] if prefs_r.ok else []
+
+        # If no preferences rows exist, fall back to all firms
+        if not firm_ids:
+            firms_r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/firms",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"select": "id"},
+                timeout=5,
+            )
+            firm_ids = [f["id"] for f in firms_r.json()] if firms_r.ok else []
+
+        results = []
+        yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+        for firm_id in firm_ids:
+            try:
+                digest = _build_digest_for_firm(firm_id, yesterday)
+
+                # Write to digest_log (dashboard channel)
+                requests.post(
+                    f"{SUPABASE_URL}/rest/v1/digest_log",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    json={
+                        "firm_id": firm_id,
+                        "channel": "dashboard",
+                        "content": digest["content"],
+                        "was_seen": False,
+                    },
+                    timeout=5,
+                )
+
+                # Send SMS via ClawdTalk if configured
+                sms_result = _send_digest_sms(firm_id, digest["sms_content"])
+
+                # Write to digest_log (sms channel)
+                requests.post(
+                    f"{SUPABASE_URL}/rest/v1/digest_log",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    json={
+                        "firm_id": firm_id,
+                        "channel": "sms",
+                        "content": digest["sms_content"],
+                    },
+                    timeout=5,
+                )
+
+                # Log notification
+                log_notification(
+                    firm_id, "sms", digest["sms_content"][:200],
+                    delivery_status="sent" if sms_result else "failed",
+                    error_code=None if sms_result else "clawdtalk_send_failed",
+                )
+
+                results.append({"firm_id": firm_id, "status": "sent"})
+            except Exception as e:
+                logging.error(f"digest for firm {firm_id}: {e}")
+                results.append({"firm_id": firm_id, "status": "error", "error": str(e)})
+
+        return jsonify({"digests": results}), 200
+    except Exception as e:
+        logging.error(f"generate_daily_digest: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def _build_digest_for_firm(firm_id, since_iso):
+    """Build digest content for a single firm."""
+    from datetime import datetime, timezone
+
+    # Fetch firm info
+    firm_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/firms",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"id": f"eq.{firm_id}", "select": "display_name,sign_off_name", "limit": "1"},
+        timeout=5,
+    )
+    firm_data = firm_r.json()[0] if firm_r.ok and firm_r.json() else {}
+    builder_name = (firm_data.get("sign_off_name") or "").split(" ")[0] or "there"
+
+    # Count audit log actions by type since yesterday
+    audit_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/audit_log",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={
+            "created_at": f"gte.{since_iso}",
+            "select": "action_type,actor_type,message",
+            "limit": "200",
+        },
+        timeout=5,
+    )
+    # Filter to this firm's projects
+    proj_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/projects",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "select": "id", "limit": "100"},
+        timeout=5,
+    )
+    project_ids = {p["id"] for p in proj_r.json()} if proj_r.ok else set()
+    active_count = len(project_ids)
+
+    # Pending queue items
+    queue_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/queue_items",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={
+            "firm_id": f"eq.{firm_id}",
+            "status": "eq.active",
+            "select": "id,title,type",
+            "limit": "50",
+        },
+        timeout=5,
+    )
+    pending_items = queue_r.json() if queue_r.ok else []
+    pending_count = len(pending_items)
+
+    # Build sections
+    actions_summary = ""
+    if audit_r.ok:
+        entries = audit_r.json()
+        hazel_actions = [e for e in entries if e.get("actor_type") == "agent"]
+        if hazel_actions:
+            actions_summary = f"Hazel completed {len(hazel_actions)} actions yesterday."
+        else:
+            actions_summary = "No agent actions yesterday."
+
+    pending_section = ""
+    if pending_count > 0:
+        pending_section = f"<strong>{pending_count} item{'s' if pending_count != 1 else ''}</strong> pending your review."
+    else:
+        pending_section = "No items pending your review."
+
+    # Dashboard content (HTML-safe)
+    content = f"{actions_summary} {pending_section}"
+
+    # SMS content (under 320 chars)
+    sms_content = f"Good morning {builder_name}. {actions_summary} {pending_section}"
+    if not hazel_actions if audit_r.ok else True:
+        sms_content = (
+            f"Good morning {builder_name}. Nothing needs your attention "
+            f"across your {active_count} active project{'s' if active_count != 1 else ''} today. "
+            f"Hazel's got it covered."
+        )
+    if len(sms_content) > 320:
+        sms_content = sms_content[:317] + "..."
+
+    return {"content": content, "sms_content": sms_content}
+
+
+CLAWDTALK_URL   = os.getenv("CLAWDTALK_URL", "https://clawdtalk.com")
+CLAWDTALK_TOKEN = os.getenv("CLAWDTALK_TOKEN", "")
+HAZEL_PHONE     = os.getenv("HAZEL_PHONE", "+12066032566")
+
+
+def _send_digest_sms(firm_id, content):
+    """Send daily digest via ClawdTalk SMS. Returns True on success."""
+    if not CLAWDTALK_TOKEN:
+        logging.warning("CLAWDTALK_TOKEN not set — skipping SMS digest")
+        return False
+
+    # Look up the firm owner's phone
+    fu_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/firm_users",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "role": "eq.owner", "select": "user_id", "limit": "1"},
+        timeout=5,
+    )
+    if not fu_r.ok or not fu_r.json():
+        logging.warning(f"No owner found for firm {firm_id}")
+        return False
+
+    owner_uid = fu_r.json()[0]["user_id"]
+
+    # Get phone from firms table
+    firm_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/firms",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"id": f"eq.{firm_id}", "select": "phone", "limit": "1"},
+        timeout=5,
+    )
+    phone = (firm_r.json()[0].get("phone") if firm_r.ok and firm_r.json() else None)
+    if not phone:
+        logging.warning(f"No phone number for firm {firm_id} — skipping SMS")
+        return False
+
+    try:
+        r = requests.post(
+            f"{CLAWDTALK_URL}/api/send",
+            headers={"Authorization": f"Bearer {CLAWDTALK_TOKEN}", "Content-Type": "application/json"},
+            json={"from": HAZEL_PHONE, "to": phone, "body": content},
+            timeout=10,
+        )
+        if r.ok:
+            logging.info(f"Digest SMS sent to firm {firm_id[:8]}")
+            return True
+        else:
+            logging.error(f"ClawdTalk SMS failed: {r.status_code} {r.text[:200]}")
+            return False
+    except Exception as e:
+        logging.error(f"ClawdTalk SMS error: {e}")
+        return False
 
 
 if __name__ == "__main__":
