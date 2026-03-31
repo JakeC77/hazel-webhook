@@ -415,6 +415,174 @@ def webhook_email():
     return jsonify({"status": "queued"}), 200
 
 
+
+# ── EPIC 2: PREFERENCES + CONTACTS ────────────────────────────────────────────
+
+@app.route("/api/preferences", methods=["GET"])
+@require_auth
+def api_preferences_get():
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_preferences",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "limit": "1"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data:
+            return jsonify(data[0]), 200
+        # Auto-create defaults
+        cr = requests.post(
+            f"{SUPABASE_URL}/rest/v1/firm_preferences",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={"firm_id": firm_id},
+            timeout=5,
+        )
+        cr.raise_for_status()
+        return jsonify(cr.json()[0]), 201
+    except Exception as e:
+        logging.error(f"api_preferences_get: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/preferences", methods=["PUT"])
+@require_auth
+def api_preferences_put():
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    allowed = {
+        "auto_send_threshold_dollars", "change_order_review_threshold",
+        "blackout_days", "blackout_start_time", "blackout_end_time",
+        "tone", "custom_phrases", "client_follow_up_days",
+        "jurisdictions", "primary_jurisdiction",
+    }
+    patch = {k: v for k, v in body.items() if k in allowed}
+    if not patch:
+        return jsonify({"error": "No valid fields to update"}), 400
+    patch["updated_at"] = "now()"
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/firm_preferences",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json=patch,
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            # Row doesn't exist yet — upsert
+            patch["firm_id"] = firm_id
+            patch.pop("updated_at", None)
+            cr = requests.post(
+                f"{SUPABASE_URL}/rest/v1/firm_preferences",
+                headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+                json=patch, timeout=5,
+            )
+            cr.raise_for_status()
+            return jsonify(cr.json()[0]), 200
+        return jsonify(data[0]), 200
+    except Exception as e:
+        logging.error(f"api_preferences_put: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/contacts", methods=["GET"])
+@require_auth
+def api_contacts_get():
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "order": "name.asc", "select": "*"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return jsonify(r.json()), 200
+    except Exception as e:
+        logging.error(f"api_contacts_get: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/contacts", methods=["POST"])
+@require_auth
+def api_contacts_post():
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    allowed = {"name","type","company","trade","phone","email","notes"}
+    contact = {k: v for k, v in body.items() if k in allowed}
+    contact["firm_id"] = firm_id
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json=contact, timeout=5,
+        )
+        r.raise_for_status()
+        return jsonify(r.json()[0]), 201
+    except Exception as e:
+        logging.error(f"api_contacts_post: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/contacts/<contact_id>", methods=["PUT"])
+@require_auth
+def api_contacts_put(contact_id):
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    allowed = {"name","type","company","trade","phone","email","notes"}
+    patch = {k: v for k, v in body.items() if k in allowed}
+    patch["updated_at"] = "now()"
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            params={"id": f"eq.{contact_id}", "firm_id": f"eq.{firm_id}"},
+            json=patch, timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return jsonify(data[0] if data else {}), 200
+    except Exception as e:
+        logging.error(f"api_contacts_put: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/contacts/<contact_id>", methods=["DELETE"])
+@require_auth
+def api_contacts_delete(contact_id):
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    try:
+        r = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{contact_id}", "firm_id": f"eq.{firm_id}"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return jsonify({"deleted": True}), 200
+    except Exception as e:
+        logging.error(f"api_contacts_delete: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
 # ── PROTECTED API ROUTES (JWT required via @require_auth) ─────────────────────
 
 
