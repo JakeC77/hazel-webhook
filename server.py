@@ -583,6 +583,40 @@ def api_contacts_delete(contact_id):
         logging.error(f"api_contacts_delete: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
+
+@app.route("/api/projects", methods=["POST"])
+@require_auth
+def api_projects_post():
+    """Create a new project for the caller's firm."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    import uuid as _uuid
+    project = {
+        "id":             body.get("id") or str(_uuid.uuid4()),
+        "name":           name,
+        "firm_id":        firm_id,
+        "status":         body.get("status", "on-track"),
+        "client_name":    body.get("client_name") or None,
+        "contract_value": body.get("contract_value") or None,
+    }
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/projects",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json=project, timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return jsonify(data[0] if data else project), 201
+    except Exception as e:
+        logging.error(f"api_projects_post: {e}")
+        return jsonify({"error": "Failed to create project"}), 500
+
 # ── PROTECTED API ROUTES (JWT required via @require_auth) ─────────────────────
 
 
