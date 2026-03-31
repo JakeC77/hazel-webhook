@@ -111,6 +111,7 @@ def require_auth(f):
                 token,
                 signing_key.key,
                 algorithms=["ES256", "HS256"],
+                audience="authenticated",
                 options={"require": ["sub", "exp"]},
             )
         except jwt.ExpiredSignatureError:
