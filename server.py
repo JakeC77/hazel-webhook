@@ -18,6 +18,27 @@ from flask import Flask, request, jsonify, g
 import jwt  # PyJWT
 
 app = Flask(__name__)
+
+# ── CORS (API routes only) ────────────────────────────────────────────────────
+CORS_ORIGINS = {
+    'https://jakec77.github.io',
+    'https://hazel.haventechsolutions.com',
+}
+
+@app.after_request
+def add_cors(response):
+    origin = request.headers.get('Origin', '')
+    if origin in CORS_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Vary'] = 'Origin'
+    return response
+
+@app.route('/api/<path:subpath>', methods=['OPTIONS'])
+def api_preflight(subpath):
+    """Handle CORS preflight for all /api/* routes."""
+    return '', 204
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 WEBHOOK_SECRET      = os.getenv("HAZEL_WEBHOOK_SECRET", "hazel-chat-2026")
