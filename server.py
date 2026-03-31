@@ -383,6 +383,59 @@ def webhook_email():
 
 # ── PROTECTED API ROUTES (JWT required via @require_auth) ─────────────────────
 
+
+@app.route("/api/firm/setup", methods=["POST"])
+@require_auth
+def api_firm_setup():
+    """Creates a firm + firm_users row for a brand-new user. Called right after signup.
+    Uses service role so no RLS issues on first insert. Idempotent: returns existing firm if found."""
+    user_id = g.user_id
+    # Idempotency: if user already has a firm, just return it
+    existing_firm_id = get_firm_id_for_user(user_id)
+    if existing_firm_id:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{existing_firm_id}", "select": "*", "limit": "1"},
+            timeout=5,
+        )
+        data = r.json()
+        return jsonify({"firm": data[0] if data else {}, "created": False}), 200
+
+    body = request.get_json(silent=True) or {}
+    firm_name = (body.get("firm_name") or "").strip()
+    if not firm_name:
+        return jsonify({"error": "firm_name is required"}), 400
+
+    try:
+        # Create firm (service role bypasses RLS)
+        r_firm = requests.post(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={"display_name": firm_name},
+            timeout=5,
+        )
+        r_firm.raise_for_status()
+        firm = r_firm.json()
+        if not firm:
+            return jsonify({"error": "Firm creation returned empty"}), 500
+        firm = firm[0]
+
+        # Link user as owner (service role)
+        r_fu = requests.post(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"firm_id": firm["id"], "user_id": user_id, "role": "owner"},
+            timeout=5,
+        )
+        r_fu.raise_for_status()
+        logging.info(f"api_firm_setup: created firm {firm['id']} for user {user_id}")
+        return jsonify({"firm": firm, "created": True}), 201
+    except Exception as e:
+        logging.error(f"api_firm_setup: {e}")
+        return jsonify({"error": "Firm setup failed"}), 500
+
+
 @app.route("/api/firm-context", methods=["GET"])
 @require_auth
 def api_firm_context():
