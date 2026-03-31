@@ -584,6 +584,27 @@ def api_contacts_delete(contact_id):
         return jsonify({"error": "Internal server error"}), 500
 
 
+@app.route("/api/projects", methods=["GET"])
+@require_auth
+def api_projects_get():
+    """Return all projects for the caller's firm (service role — bypasses RLS)."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/projects",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "select": "*", "order": "created_at.asc"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return jsonify(r.json()), 200
+    except Exception as e:
+        logging.error(f"api_projects_get: {e}")
+        return jsonify({"error": "Failed to fetch projects"}), 500
+
+
 @app.route("/api/projects", methods=["POST"])
 @require_auth
 def api_projects_post():
