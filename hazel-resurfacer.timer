@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hazel resurfacer every 15 minutes
+Requires=hazel-resurfacer.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

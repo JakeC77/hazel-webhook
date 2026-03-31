@@ -1,0 +1,12 @@
+[Unit]
+Description=Hazel AQ-04 Hold Re-surface Poller
+After=network.target
+
+[Service]
+Type=oneshot
+User=openclaw
+WorkingDirectory=/home/openclaw/hazel-chat-webhook
+EnvironmentFile=/etc/systemd/system/hazel-chat-webhook.service.env
+ExecStart=/home/openclaw/hazel-chat-webhook/venv/bin/python resurfacer.py
+StandardOutput=journal
+StandardError=journal

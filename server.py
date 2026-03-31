@@ -638,6 +638,115 @@ def api_projects_post():
         logging.error(f"api_projects_post: {e}")
         return jsonify({"error": "Failed to create project"}), 500
 
+# ── EPIC 3: QUEUE HARDENING ───────────────────────────────────────────────────
+
+VALID_TRANSITIONS = {
+    "active":  {"approve", "reject", "hold"},
+    "snoozed": {"approve", "reject", "hold", "reactivate"},
+}
+
+@app.route("/api/queue/<item_id>/decide", methods=["POST"])
+@require_auth
+def api_queue_decide(item_id):
+    """AQ-02: Validate + apply a status transition on a queue item.
+    Body: { action: 'approve'|'reject'|'hold', resurface_hours: int (optional, for hold) }
+    Returns 409 if the current status doesn't allow the action."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "").strip().lower()
+    if action not in {"approve", "reject", "hold", "reactivate"}:
+        return jsonify({"error": "action must be approve|reject|hold|reactivate"}), 400
+
+    try:
+        # Fetch current item (service role)
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/queue_items",
+            headers={**SB_HEADERS},
+            params={"id": f"eq.{item_id}", "select": "id,status,project_id,firm_id", "limit": "1"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return jsonify({"error": "Queue item not found"}), 404
+        item = rows[0]
+
+        # Firm scope check
+        if item.get("firm_id") != firm_id:
+            return jsonify({"error": "Forbidden"}), 403
+
+        current_status = item.get("status", "active")
+        allowed = VALID_TRANSITIONS.get(current_status, set())
+        if action not in allowed:
+            return jsonify({
+                "error": f"Cannot {action} an item with status '{current_status}'",
+                "current_status": current_status,
+            }), 409
+
+        # Build update payload
+        now_iso = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+        if action == "approve":
+            patch = {"status": "approved", "decided_at": now_iso, "decided_by": "builder"}
+        elif action == "reject":
+            patch = {"status": "rejected", "decided_at": now_iso, "decided_by": "builder"}
+        elif action == "hold":
+            resurface_hours = int(body.get("resurface_hours", 24))
+            patch = {
+                "status": "snoozed",
+                "held_at": now_iso,
+                "resurface_after": f"{resurface_hours} hours",
+                "reminder_at": None,
+            }
+        elif action == "reactivate":
+            patch = {"status": "active", "held_at": None}
+
+        upd = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/queue_items",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            params={"id": f"eq.{item_id}"},
+            json=patch,
+            timeout=5,
+        )
+        upd.raise_for_status()
+        updated = upd.json()
+        return jsonify(updated[0] if updated else {"id": item_id, **patch}), 200
+
+    except Exception as e:
+        logging.error(f"api_queue_decide: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/queue/<item_id>/version", methods=["POST"])
+@require_auth
+def api_queue_save_version(item_id):
+    """AQ-01: Persist a draft version snapshot to queue_item_versions."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+
+    body = request.get_json(silent=True) or {}
+    draft   = body.get("draft")
+    version = body.get("version_number", 1)
+    saved_by = body.get("saved_by", "builder")
+
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/queue_item_versions",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={"queue_item_id": item_id, "version_number": version, "draft": draft, "saved_by": saved_by},
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return jsonify(data[0] if data else {}), 201
+    except Exception as e:
+        logging.error(f"api_queue_save_version: {e}")
+        return jsonify({"error": "Failed to save version"}), 500
+
+
 # ── PROTECTED API ROUTES (JWT required via @require_auth) ─────────────────────
 
 
