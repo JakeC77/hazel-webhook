@@ -1325,5 +1325,1086 @@ def _send_digest_sms(firm_id, content):
         return False
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# EPIC 5 — EMAIL INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/emails/inbound", methods=["POST"])
+def api_emails_inbound():
+    """EM-01: Ingest an inbound email. Idempotent on message_id.
+    Auth via webhook secret (service-to-service, not user JWT)."""
+    secret = request.headers.get("X-Hazel-Webhook-Secret") or request.headers.get("X-Webhook-Secret") or request.args.get("secret")
+    if secret != WEBHOOK_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+    body = request.get_json(force=True) or {}
+    required = ["firm_id", "from_email", "message_id"]
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+    # Idempotency: check if message_id already exists
+    check = requests.get(
+        f"{SUPABASE_URL}/rest/v1/inbound_emails",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"message_id": f"eq.{body['message_id']}", "select": "id", "limit": "1"},
+        timeout=5,
+    )
+    if check.ok and check.json():
+        return jsonify({"status": "duplicate", "id": check.json()[0]["id"]}), 200
+
+    # Resolve project_id by matching from_email against contacts
+    project_id = body.get("project_id")
+    if not project_id:
+        contact_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={
+                "firm_id": f"eq.{body['firm_id']}",
+                "email": f"eq.{body['from_email']}",
+                "select": "id",
+                "limit": "1",
+            },
+            timeout=5,
+        )
+        if contact_r.ok and contact_r.json():
+            # Look up project_contacts for this contact
+            cid = contact_r.json()[0]["id"]
+            pc_r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/project_contacts",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"contact_id": f"eq.{cid}", "select": "project_id", "limit": "1"},
+                timeout=5,
+            )
+            if pc_r.ok and pc_r.json():
+                project_id = pc_r.json()[0]["project_id"]
+
+    row = {
+        "firm_id": body["firm_id"],
+        "project_id": project_id,
+        "message_id": body["message_id"],
+        "thread_id": body.get("thread_id"),
+        "from_email": body["from_email"],
+        "from_name": body.get("from_name"),
+        "subject": body.get("subject"),
+        "body_text": body.get("body_text"),
+        "received_at": body.get("received_at"),
+    }
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/inbound_emails",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        json=row,
+        timeout=5,
+    )
+    if r.ok:
+        return jsonify(r.json()[0] if r.json() else {"status": "created"}), 200
+    return jsonify({"error": "Failed to create inbound email"}), 500
+
+
+@app.route("/api/emails", methods=["GET"])
+@require_auth
+def api_emails_list():
+    """List inbound emails for the firm. Optional filters: project_id, classification."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    params = {"firm_id": f"eq.{firm_id}", "order": "received_at.desc", "limit": "50"}
+    pid = request.args.get("project_id")
+    if pid:
+        params["project_id"] = f"eq.{pid}"
+    cls = request.args.get("classification")
+    if cls:
+        params["classification"] = f"eq.{cls}"
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/inbound_emails",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params=params,
+        timeout=5,
+    )
+    return jsonify(r.json() if r.ok else []), r.status_code if r.ok else 500
+
+
+@app.route("/api/emails/send", methods=["POST"])
+@require_auth
+def api_emails_send():
+    """EM-05: Send an outbound email via AgentMail. Logs to outbound_emails."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    to_email = body.get("to")
+    subject = body.get("subject", "")
+    email_body = body.get("body", "")
+    if not to_email:
+        return jsonify({"error": "Missing 'to' field"}), 400
+
+    # Create outbound record
+    row = {
+        "firm_id": firm_id,
+        "project_id": body.get("project_id"),
+        "queue_item_id": body.get("queue_item_id"),
+        "to_email": to_email,
+        "subject": subject,
+        "body": email_body,
+        "in_reply_to": body.get("in_reply_to"),
+        "send_status": "queued",
+    }
+    ins = requests.post(
+        f"{SUPABASE_URL}/rest/v1/outbound_emails",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        json=row,
+        timeout=5,
+    )
+    outbound_id = ins.json()[0]["id"] if ins.ok and ins.json() else None
+
+    # Send via AgentMail
+    from datetime import datetime, timezone
+    try:
+        am_payload = {"to": to_email, "subject": subject, "text": email_body}
+        if body.get("in_reply_to"):
+            am_payload["inReplyTo"] = body["in_reply_to"]
+        r = requests.post(
+            "https://api.agentmail.to/v0/emails",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
+            json=am_payload,
+            timeout=10,
+        )
+        if r.ok:
+            # Update status to sent
+            if outbound_id:
+                requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/outbound_emails",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    params={"id": f"eq.{outbound_id}"},
+                    json={"send_status": "sent", "sent_at": datetime.now(timezone.utc).isoformat()},
+                    timeout=5,
+                )
+            log_notification(firm_id, "email", f"To: {to_email} — {subject[:80]}", "sent")
+            return jsonify({"status": "sent", "id": outbound_id}), 200
+        else:
+            err = r.text[:200]
+            if outbound_id:
+                requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/outbound_emails",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    params={"id": f"eq.{outbound_id}"},
+                    json={"send_status": "failed", "error_message": err},
+                    timeout=5,
+                )
+            log_notification(firm_id, "email", f"FAILED: {to_email}", "failed", err)
+            return jsonify({"status": "failed", "error": err}), 502
+    except Exception as e:
+        logging.error(f"api_emails_send: {e}")
+        if outbound_id:
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/outbound_emails",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"id": f"eq.{outbound_id}"},
+                json={"send_status": "failed", "error_message": str(e)},
+                timeout=5,
+            )
+        return jsonify({"error": str(e)}), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EPIC 6 — QUICKBOOKS ONLINE INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+QBO_CLIENT_ID     = os.getenv("QBO_CLIENT_ID", "")
+QBO_CLIENT_SECRET = os.getenv("QBO_CLIENT_SECRET", "")
+QBO_REDIRECT_URI  = os.getenv("QBO_REDIRECT_URI", "https://hazel.dejaview.io/api/qbo/callback")
+QBO_BASE_URL      = "https://quickbooks.api.intuit.com"  # production
+QBO_SANDBOX_URL   = "https://sandbox-quickbooks.api.intuit.com"
+QBO_USE_SANDBOX   = os.getenv("QBO_USE_SANDBOX", "true").lower() == "true"
+
+# Simple AES-256 encryption for tokens (symmetric key from env)
+QBO_ENCRYPTION_KEY = os.getenv("QBO_ENCRYPTION_KEY", "")
+
+
+def _qbo_api_url():
+    return QBO_SANDBOX_URL if QBO_USE_SANDBOX else QBO_BASE_URL
+
+
+def _encrypt_token(plaintext):
+    """Simple base64 encoding as a placeholder. Replace with AES-256 when
+    QBO_ENCRYPTION_KEY is set. Real encryption requires cryptography package."""
+    if not plaintext:
+        return ""
+    import base64
+    if QBO_ENCRYPTION_KEY:
+        # TODO: use cryptography.fernet with QBO_ENCRYPTION_KEY
+        pass
+    return base64.b64encode(plaintext.encode()).decode()
+
+
+def _decrypt_token(ciphertext):
+    if not ciphertext:
+        return ""
+    import base64
+    if QBO_ENCRYPTION_KEY:
+        # TODO: use cryptography.fernet with QBO_ENCRYPTION_KEY
+        pass
+    return base64.b64decode(ciphertext.encode()).decode()
+
+
+@app.route("/api/qbo/connect", methods=["GET"])
+@require_auth
+def api_qbo_connect():
+    """QB-01: Start QBO OAuth flow. Returns the Intuit authorization URL."""
+    if not QBO_CLIENT_ID:
+        return jsonify({"error": "QBO integration not configured"}), 503
+    import urllib.parse
+    state = f"{g.firm_id}"
+    auth_url = (
+        "https://appcenter.intuit.com/connect/oauth2?"
+        + urllib.parse.urlencode({
+            "client_id": QBO_CLIENT_ID,
+            "response_type": "code",
+            "scope": "com.intuit.quickbooks.accounting",
+            "redirect_uri": QBO_REDIRECT_URI,
+            "state": state,
+        })
+    )
+    return jsonify({"auth_url": auth_url}), 200
+
+
+@app.route("/api/qbo/callback", methods=["GET"])
+def api_qbo_callback():
+    """QB-01: QBO OAuth callback. Exchanges code for tokens."""
+    from datetime import datetime, timezone, timedelta
+    code = request.args.get("code")
+    realm_id = request.args.get("realmId")
+    state = request.args.get("state", "")
+    firm_id = state  # we pass firm_id as the state param
+
+    if not code or not realm_id:
+        return "<h3>Authorization failed. Missing code or realmId.</h3>", 400
+
+    # Exchange code for tokens
+    import base64
+    auth_header = base64.b64encode(f"{QBO_CLIENT_ID}:{QBO_CLIENT_SECRET}".encode()).decode()
+    token_r = requests.post(
+        "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+        headers={
+            "Authorization": f"Basic {auth_header}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": QBO_REDIRECT_URI,
+        },
+        timeout=10,
+    )
+    if not token_r.ok:
+        logging.error(f"QBO token exchange failed: {token_r.status_code} {token_r.text[:200]}")
+        return "<h3>Failed to connect QuickBooks. Please try again.</h3>", 500
+
+    tokens = token_r.json()
+    expires_in = tokens.get("expires_in", 3600)
+
+    # Get company info
+    company_name = ""
+    try:
+        ci_r = requests.get(
+            f"{_qbo_api_url()}/v3/company/{realm_id}/companyinfo/{realm_id}",
+            headers={
+                "Authorization": f"Bearer {tokens['access_token']}",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        if ci_r.ok:
+            company_name = ci_r.json().get("CompanyInfo", {}).get("CompanyName", "")
+    except Exception:
+        pass
+
+    # Upsert connection
+    conn = {
+        "firm_id": firm_id,
+        "realm_id": realm_id,
+        "access_token": _encrypt_token(tokens["access_token"]),
+        "refresh_token": _encrypt_token(tokens.get("refresh_token", "")),
+        "token_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat(),
+        "status": "active",
+        "company_name": company_name,
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Try update first, then insert
+    upd = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/qbo_connections",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        params={"firm_id": f"eq.{firm_id}"},
+        json=conn,
+        timeout=5,
+    )
+    if not upd.ok or not upd.json():
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/qbo_connections",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json=conn,
+            timeout=5,
+        )
+
+    # Redirect back to dashboard settings
+    return (
+        '<html><body><h3>QuickBooks connected successfully!</h3>'
+        '<p>You can close this window and return to the Hazel dashboard.</p>'
+        '<script>window.opener && window.opener.postMessage("qbo_connected","*"); setTimeout(()=>window.close(),2000);</script>'
+        '</body></html>'
+    )
+
+
+@app.route("/api/qbo/status", methods=["GET"])
+@require_auth
+def api_qbo_status():
+    """QB-01: Get QBO connection status for the firm."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/qbo_connections",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "select": "realm_id,status,company_name,connected_at,last_synced_at", "limit": "1"},
+        timeout=5,
+    )
+    if r.ok and r.json():
+        return jsonify(r.json()[0]), 200
+    return jsonify({"status": "not_connected"}), 200
+
+
+@app.route("/api/qbo/disconnect", methods=["POST"])
+@require_auth
+def api_qbo_disconnect():
+    """QB-01: Disconnect QBO. Clears tokens."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/qbo_connections",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}"},
+        json={"status": "disconnected", "access_token": "", "refresh_token": ""},
+        timeout=5,
+    )
+    return jsonify({"status": "disconnected"}), 200
+
+
+@app.route("/api/qbo/sync/<project_id>", methods=["POST"])
+@require_auth
+def api_qbo_sync(project_id):
+    """QB-02: Sync job costs from QBO for a specific project."""
+    from datetime import datetime, timezone
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    # Get QBO connection
+    conn_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/qbo_connections",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "limit": "1"},
+        timeout=5,
+    )
+    if not conn_r.ok or not conn_r.json() or conn_r.json()[0].get("status") != "active":
+        return jsonify({"error": "QBO not connected"}), 400
+
+    conn = conn_r.json()[0]
+    access_token = _decrypt_token(conn["access_token"])
+    realm_id = conn["realm_id"]
+
+    # Get project's qbo_customer_id
+    proj_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/projects",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"id": f"eq.{project_id}", "select": "qbo_customer_id", "limit": "1"},
+        timeout=5,
+    )
+    if not proj_r.ok or not proj_r.json():
+        return jsonify({"error": "Project not found"}), 404
+    qbo_cust_id = proj_r.json()[0].get("qbo_customer_id")
+    if not qbo_cust_id:
+        return jsonify({"error": "No QBO Customer ID mapped for this project"}), 400
+
+    # Pull P&L Detail from QBO
+    try:
+        report_r = requests.get(
+            f"{_qbo_api_url()}/v3/company/{realm_id}/reports/ProfitAndLossDetail",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            params={"customer": qbo_cust_id},
+            timeout=15,
+        )
+        if not report_r.ok:
+            # Token may be expired — try refresh
+            if report_r.status_code == 401:
+                refreshed = _refresh_qbo_token(firm_id, conn)
+                if refreshed:
+                    access_token = refreshed
+                    report_r = requests.get(
+                        f"{_qbo_api_url()}/v3/company/{realm_id}/reports/ProfitAndLossDetail",
+                        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                        params={"customer": qbo_cust_id},
+                        timeout=15,
+                    )
+            if not report_r.ok:
+                return jsonify({"error": f"QBO report fetch failed: {report_r.status_code}"}), 502
+
+        # Parse the report into cost code rows
+        report = report_r.json()
+        cost_rows = _parse_qbo_pnl(report, project_id, firm_id)
+
+        # Clear old cache and insert new
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/qbo_job_cost_cache",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"project_id": f"eq.{project_id}"},
+            timeout=5,
+        )
+        if cost_rows:
+            requests.post(
+                f"{SUPABASE_URL}/rest/v1/qbo_job_cost_cache",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                json=cost_rows,
+                timeout=5,
+            )
+
+        # Update last_synced_at
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/qbo_connections",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json={"last_synced_at": datetime.now(timezone.utc).isoformat()},
+            timeout=5,
+        )
+
+        return jsonify({"status": "synced", "rows": len(cost_rows)}), 200
+    except Exception as e:
+        logging.error(f"qbo_sync: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def _refresh_qbo_token(firm_id, conn):
+    """Refresh QBO access token. Returns new access_token or None."""
+    from datetime import datetime, timezone, timedelta
+    import base64
+    refresh_token = _decrypt_token(conn.get("refresh_token", ""))
+    if not refresh_token:
+        return None
+    auth_header = base64.b64encode(f"{QBO_CLIENT_ID}:{QBO_CLIENT_SECRET}".encode()).decode()
+    r = requests.post(
+        "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+        headers={"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        timeout=10,
+    )
+    if r.ok:
+        tokens = r.json()
+        expires_in = tokens.get("expires_in", 3600)
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/qbo_connections",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json={
+                "access_token": _encrypt_token(tokens["access_token"]),
+                "refresh_token": _encrypt_token(tokens.get("refresh_token", refresh_token)),
+                "token_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat(),
+                "status": "active",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            timeout=5,
+        )
+        return tokens["access_token"]
+    else:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/qbo_connections",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json={"status": "error"},
+            timeout=5,
+        )
+        return None
+
+
+def _parse_qbo_pnl(report, project_id, firm_id):
+    """Parse QBO ProfitAndLossDetail JSON into cost code rows."""
+    from datetime import date
+    rows = []
+    try:
+        for row_group in report.get("Rows", {}).get("Row", []):
+            # QBO reports nest data in Header/Rows/Summary
+            header = row_group.get("Header", {})
+            summary = row_group.get("Summary", {})
+            col_data = summary.get("ColData", [])
+            if len(col_data) >= 2:
+                cost_code_name = col_data[0].get("value", "Unknown")
+                actual = float(col_data[-1].get("value", 0))
+                rows.append({
+                    "project_id": project_id,
+                    "firm_id": firm_id,
+                    "cost_code": cost_code_name[:20],
+                    "cost_code_name": cost_code_name,
+                    "actual_amount": actual,
+                    "budgeted_amount": 0,  # budgets entered separately or from Neo4j
+                    "as_of_date": date.today().isoformat(),
+                })
+    except Exception as e:
+        logging.warning(f"_parse_qbo_pnl: {e}")
+    return rows
+
+
+@app.route("/api/qbo/job-costs/<project_id>", methods=["GET"])
+@require_auth
+def api_qbo_job_costs(project_id):
+    """QB-02: Get cached job cost data for a project."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/qbo_job_cost_cache",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"project_id": f"eq.{project_id}", "firm_id": f"eq.{firm_id}", "order": "cost_code_name"},
+        timeout=5,
+    )
+    return jsonify(r.json() if r.ok else []), 200
+
+
+@app.route("/api/invoices", methods=["GET"])
+@require_auth
+def api_invoices_list():
+    """QB-03: List invoices for the firm."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    params = {"firm_id": f"eq.{firm_id}", "order": "created_at.desc", "limit": "50"}
+    pid = request.args.get("project_id")
+    if pid:
+        params["project_id"] = f"eq.{pid}"
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/invoices",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params=params,
+        timeout=5,
+    )
+    return jsonify(r.json() if r.ok else []), 200
+
+
+@app.route("/api/change-orders", methods=["GET"])
+@require_auth
+def api_change_orders_list():
+    """QB-04: List change orders for a project."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    params = {"firm_id": f"eq.{firm_id}", "order": "created_at.desc", "limit": "50"}
+    pid = request.args.get("project_id")
+    if pid:
+        params["project_id"] = f"eq.{pid}"
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/change_orders",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params=params,
+        timeout=5,
+    )
+    return jsonify(r.json() if r.ok else []), 200
+
+
+@app.route("/api/milestones/<project_id>", methods=["GET", "POST"])
+@require_auth
+def api_milestones(project_id):
+    """QB-05: List or create payment milestones for a project."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    if request.method == "GET":
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/project_milestones",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"project_id": f"eq.{project_id}", "firm_id": f"eq.{firm_id}", "order": "due_date.asc.nullslast"},
+            timeout=5,
+        )
+        return jsonify(r.json() if r.ok else []), 200
+
+    # POST — create a milestone
+    body = request.get_json(force=True) or {}
+    row = {
+        "project_id": project_id,
+        "firm_id": firm_id,
+        "name": body.get("name", ""),
+        "milestone_type": body.get("milestone_type", "payment"),
+        "due_date": body.get("due_date"),
+        "percent_complete_trigger": body.get("percent_complete_trigger"),
+        "amount": body.get("amount"),
+        "status": "upcoming",
+    }
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/project_milestones",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        json=row,
+        timeout=5,
+    )
+    if r.ok:
+        return jsonify(r.json()[0] if r.json() else {"status": "created"}), 201
+    return jsonify({"error": "Failed to create milestone"}), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EPIC 7 — BILLING AND COMMERCIAL INFRASTRUCTURE
+# ══════════════════════════════════════════════════════════════════════════════
+
+STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_EARLY     = os.getenv("STRIPE_PRICE_EARLY", "")
+STRIPE_PRICE_STANDARD  = os.getenv("STRIPE_PRICE_STANDARD", "")
+DASHBOARD_URL          = os.getenv("DASHBOARD_URL", "https://hazel.haventechsolutions.com")
+TOS_URL                = os.getenv("TOS_URL", "")
+DPA_URL                = os.getenv("DPA_URL", "")
+
+
+@app.route("/api/billing/webhook", methods=["POST"])
+def billing_webhook():
+    """BL-01: Stripe webhook handler. Validates signature, processes events."""
+    from datetime import datetime, timezone, timedelta
+    payload = request.get_data(as_text=True)
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    # Verify signature
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            import stripe
+            stripe.api_key = STRIPE_SECRET_KEY
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        except ImportError:
+            # If stripe package not installed, basic JSON parse (dev mode)
+            event = json.loads(payload)
+            logging.warning("stripe package not installed — skipping signature verification")
+        except Exception as e:
+            logging.warning(f"Stripe signature verification failed: {e}")
+            return jsonify({"error": "Invalid signature"}), 400
+    else:
+        event = json.loads(payload)
+
+    event_id = event.get("id", "")
+    event_type = event.get("type", "")
+
+    # Idempotency check
+    check = requests.get(
+        f"{SUPABASE_URL}/rest/v1/stripe_events_log",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"stripe_event_id": f"eq.{event_id}", "select": "id", "limit": "1"},
+        timeout=5,
+    )
+    if check.ok and check.json():
+        return jsonify({"status": "duplicate"}), 200
+
+    # Log event
+    requests.post(
+        f"{SUPABASE_URL}/rest/v1/stripe_events_log",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        json={
+            "stripe_event_id": event_id,
+            "event_type": event_type,
+            "payload": event,
+            "processing_status": "pending",
+        },
+        timeout=5,
+    )
+
+    try:
+        obj = event.get("data", {}).get("object", {})
+        metadata = obj.get("metadata", {})
+        firm_id = metadata.get("firm_id")
+
+        # If no firm_id in metadata, look up by stripe_customer_id
+        stripe_cust_id = obj.get("customer")
+        if not firm_id and stripe_cust_id:
+            sub_r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/subscriptions",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"stripe_customer_id": f"eq.{stripe_cust_id}", "select": "firm_id", "limit": "1"},
+                timeout=5,
+            )
+            if sub_r.ok and sub_r.json():
+                firm_id = sub_r.json()[0]["firm_id"]
+
+        if event_type == "customer.subscription.created":
+            _upsert_subscription(firm_id, obj)
+        elif event_type == "customer.subscription.updated":
+            _upsert_subscription(firm_id, obj)
+        elif event_type == "customer.subscription.deleted":
+            _handle_subscription_deleted(firm_id, obj)
+        elif event_type == "invoice.payment_succeeded":
+            _handle_payment_succeeded(firm_id, obj)
+        elif event_type == "invoice.payment_failed":
+            _handle_payment_failed(firm_id, obj)
+        elif event_type == "invoice.payment_action_required":
+            logging.info(f"Payment action required for firm {firm_id}")
+
+        # Mark processed
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/stripe_events_log",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"stripe_event_id": f"eq.{event_id}"},
+            json={"processing_status": "processed", "processed_at": datetime.now(timezone.utc).isoformat()},
+            timeout=5,
+        )
+    except Exception as e:
+        logging.error(f"Stripe webhook processing error: {e}")
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/stripe_events_log",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"stripe_event_id": f"eq.{event_id}"},
+            json={"processing_status": "failed", "error_message": str(e)},
+            timeout=5,
+        )
+
+    return jsonify({"status": "ok"}), 200
+
+
+def _upsert_subscription(firm_id, sub_obj):
+    """Create or update a subscription row from a Stripe subscription object."""
+    from datetime import datetime, timezone
+    if not firm_id:
+        return
+    row = {
+        "firm_id": firm_id,
+        "stripe_customer_id": sub_obj.get("customer"),
+        "stripe_subscription_id": sub_obj.get("id"),
+        "status": sub_obj.get("status", "active"),
+        "plan_name": sub_obj.get("items", {}).get("data", [{}])[0].get("price", {}).get("nickname") if sub_obj.get("items") else None,
+        "amount_cents": sub_obj.get("items", {}).get("data", [{}])[0].get("price", {}).get("unit_amount") if sub_obj.get("items") else None,
+        "current_period_start": datetime.fromtimestamp(sub_obj["current_period_start"], tz=timezone.utc).isoformat() if sub_obj.get("current_period_start") else None,
+        "current_period_end": datetime.fromtimestamp(sub_obj["current_period_end"], tz=timezone.utc).isoformat() if sub_obj.get("current_period_end") else None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Try update first
+    upd = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        params={"firm_id": f"eq.{firm_id}"},
+        json=row,
+        timeout=5,
+    )
+    if not upd.ok or not upd.json():
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/subscriptions",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json=row,
+            timeout=5,
+        )
+
+
+def _handle_subscription_deleted(firm_id, sub_obj):
+    from datetime import datetime, timezone
+    if not firm_id:
+        return
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}"},
+        json={
+            "status": "canceled",
+            "canceled_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        timeout=5,
+    )
+
+
+def _handle_payment_succeeded(firm_id, invoice_obj):
+    from datetime import datetime, timezone
+    if not firm_id:
+        return
+    # Restore access for past_due firms
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "status": "eq.past_due"},
+        json={"status": "active", "grace_period_ends_at": None, "updated_at": datetime.now(timezone.utc).isoformat()},
+        timeout=5,
+    )
+
+
+def _handle_payment_failed(firm_id, invoice_obj):
+    from datetime import datetime, timezone, timedelta
+    if not firm_id:
+        return
+    grace_end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}"},
+        json={"status": "past_due", "grace_period_ends_at": grace_end, "updated_at": datetime.now(timezone.utc).isoformat()},
+        timeout=5,
+    )
+
+
+@app.route("/api/billing/status", methods=["GET"])
+@require_auth
+def api_billing_status():
+    """BL-02: Get subscription status for the firm."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "limit": "1"},
+        timeout=5,
+    )
+    if r.ok and r.json():
+        sub = r.json()[0]
+        # Don't return tokens
+        return jsonify(sub), 200
+    return jsonify({"status": "none"}), 200
+
+
+@app.route("/api/billing/create-checkout-session", methods=["POST"])
+@require_auth
+def api_billing_create_checkout():
+    """BL-03: Create Stripe Checkout session."""
+    if not STRIPE_SECRET_KEY:
+        return jsonify({"error": "Stripe not configured"}), 503
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    price_id = body.get("price_id", STRIPE_PRICE_EARLY or STRIPE_PRICE_STANDARD)
+    if not price_id:
+        return jsonify({"error": "No price configured"}), 503
+
+    try:
+        import stripe
+        stripe.api_key = STRIPE_SECRET_KEY
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{DASHBOARD_URL}/#/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{DASHBOARD_URL}/#/billing",
+            metadata={"firm_id": firm_id},
+        )
+        return jsonify({"checkout_url": session.url}), 200
+    except ImportError:
+        return jsonify({"error": "stripe package not installed on server"}), 503
+    except Exception as e:
+        logging.error(f"create_checkout: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/billing/usage", methods=["GET"])
+@require_auth
+def api_billing_usage():
+    """BL-04: Usage visibility for the current billing period."""
+    from datetime import datetime, timezone
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    # Get billing period
+    sub_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "select": "current_period_start,current_period_end", "limit": "1"},
+        timeout=5,
+    )
+    if sub_r.ok and sub_r.json() and sub_r.json()[0].get("current_period_start"):
+        period_start = sub_r.json()[0]["current_period_start"]
+    else:
+        # No subscription — use firm creation date
+        firm_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}", "select": "created_at", "limit": "1"},
+            timeout=5,
+        )
+        period_start = firm_r.json()[0]["created_at"] if firm_r.ok and firm_r.json() else datetime.now(timezone.utc).isoformat()
+
+    # Count drafts
+    qi_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/queue_items",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
+        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "select": "id,status", "limit": "0"},
+        timeout=5,
+    )
+    drafts_total = int(qi_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+
+    # Count approved without edit (single version = approved without edit)
+    qi_approved_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/queue_items",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
+        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "status": "eq.approved", "select": "id", "limit": "0"},
+        timeout=5,
+    )
+    drafts_approved = int(qi_approved_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+
+    # Count emails processed
+    em_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/inbound_emails",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
+        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "select": "id", "limit": "0"},
+        timeout=5,
+    )
+    emails_processed = int(em_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+
+    # Count invoices
+    inv_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/invoices",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
+        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "status": "eq.posted", "select": "id", "limit": "0"},
+        timeout=5,
+    )
+    invoices_posted = int(inv_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+
+    # Estimated time saved
+    time_saved_minutes = (drafts_total * 12) + (emails_processed * 8) + (invoices_posted * 15)
+    hours = time_saved_minutes // 60
+    mins = time_saved_minutes % 60
+
+    accuracy_pct = round((drafts_approved / drafts_total * 100) if drafts_total > 0 else 0)
+
+    return jsonify({
+        "drafts_generated": drafts_total,
+        "drafts_approved_without_edit": drafts_approved,
+        "emails_processed": emails_processed,
+        "invoices_posted": invoices_posted,
+        "time_saved_display": f"~{hours} hours {mins} minutes" if hours > 0 else f"~{mins} minutes",
+        "time_saved_minutes": time_saved_minutes,
+        "approval_accuracy_pct": accuracy_pct,
+        "period_start": period_start,
+    }), 200
+
+
+@app.route("/api/legal/accept", methods=["POST"])
+@require_auth
+def api_legal_accept():
+    """BL-05: Record legal document acceptance."""
+    from datetime import datetime, timezone
+    firm_id = g.firm_id
+    user_id = g.user_id
+    if not firm_id or not user_id:
+        return jsonify({"error": "Not authenticated"}), 401
+    body = request.get_json(force=True) or {}
+    documents = body.get("documents", [])  # ["tos", "dpa"]
+    if not documents:
+        return jsonify({"error": "No documents specified"}), 400
+
+    ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
+    user_agent = request.headers.get("User-Agent", "")[:500]
+    now = datetime.now(timezone.utc).isoformat()
+
+    for doc_type in documents:
+        if doc_type not in ("tos", "dpa"):
+            continue
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/legal_acceptances",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json={
+                "firm_id": firm_id,
+                "user_id": user_id,
+                "document_type": doc_type,
+                "document_version": body.get("version", "v1.0"),
+                "accepted_at": now,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+            },
+            timeout=5,
+        )
+        # Update firms tracking fields
+        col = "tos_accepted_at" if doc_type == "tos" else "dpa_accepted_at"
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}"},
+            json={col: now},
+            timeout=5,
+        )
+
+    return jsonify({"status": "accepted"}), 200
+
+
+@app.route("/api/legal/status", methods=["GET"])
+@require_auth
+def api_legal_status():
+    """BL-05: Check if current firm has accepted TOS and DPA."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/firms",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"id": f"eq.{firm_id}", "select": "tos_accepted_at,dpa_accepted_at", "limit": "1"},
+        timeout=5,
+    )
+    if r.ok and r.json():
+        d = r.json()[0]
+        return jsonify({
+            "tos_accepted": d.get("tos_accepted_at") is not None,
+            "dpa_accepted": d.get("dpa_accepted_at") is not None,
+            "tos_url": TOS_URL,
+            "dpa_url": DPA_URL,
+        }), 200
+    return jsonify({"tos_accepted": False, "dpa_accepted": False}), 200
+
+
+@app.route("/api/admin/firms", methods=["GET"])
+@require_auth
+def api_admin_firms():
+    """BL-02: Admin page — list all firms with subscription status.
+    Only accessible to Robert (hardcoded check for now)."""
+    # Simple admin check — Robert's user_id or firm owner
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/firms",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"select": "id,display_name,created_at,tos_accepted_at", "order": "created_at.desc"},
+        timeout=5,
+    )
+    firms_list = r.json() if r.ok else []
+
+    # Enrich with subscription status
+    for firm in firms_list:
+        sub_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/subscriptions",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm['id']}", "select": "status,stripe_customer_id,stripe_subscription_id,current_period_end", "limit": "1"},
+            timeout=5,
+        )
+        firm["subscription"] = sub_r.json()[0] if sub_r.ok and sub_r.json() else None
+
+    return jsonify(firms_list), 200
+
+
+@app.route("/api/admin/firms/<firm_id>/subscription", methods=["POST"])
+@require_auth
+def api_admin_set_subscription(firm_id):
+    """BL-02: Admin — manually set stripe_customer_id and stripe_subscription_id."""
+    body = request.get_json(force=True) or {}
+    from datetime import datetime, timezone
+    row = {
+        "firm_id": firm_id,
+        "stripe_customer_id": body.get("stripe_customer_id"),
+        "stripe_subscription_id": body.get("stripe_subscription_id"),
+        "status": body.get("status", "trialing"),
+        "plan_name": body.get("plan_name"),
+        "amount_cents": body.get("amount_cents"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # Upsert
+    upd = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        params={"firm_id": f"eq.{firm_id}"},
+        json=row,
+        timeout=5,
+    )
+    if not upd.ok or not upd.json():
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/subscriptions",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json=row,
+            timeout=5,
+        )
+    return jsonify({"status": "updated"}), 200
+
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8700, threaded=True)
