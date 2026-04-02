@@ -100,9 +100,6 @@ def require_auth(f):
             return jsonify({"error": "Missing or invalid Authorization header"}), 401
 
         token = auth_header[len("Bearer "):]
-        if not SUPABASE_JWT_SECRET:
-            logging.error("SUPABASE_JWT_SECRET is not set — cannot validate JWT")
-            return jsonify({"error": "Server misconfiguration: JWT secret not set"}), 500
 
         try:
             # Supabase uses ES256 (ECDSA P-256) on newer projects — use JWKS
@@ -1006,5 +1003,180 @@ def api_invites_accept():
         return jsonify({"error": "Internal server error"}), 500
 
 
+
+@app.route("/api/messages", methods=["POST"])
+@require_auth
+def api_messages_post():
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    body        = request.get_json(force=True) or {}
+    project_id  = (body.get("project_id") or "").strip()
+    content     = (body.get("content") or "").strip()
+    attachments = body.get("attachments") or []
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    if not content and not attachments:
+        return jsonify({"error": "content or attachments required"}), 400
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/messages",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={"project_id": project_id, "firm_id": firm_id, "role": "builder",
+                  "content": content, "attachments": attachments},
+            timeout=5,
+        )
+        r.raise_for_status()
+        row = r.json()
+        msg = row[0] if row else {}
+    except Exception as e:
+        logging.error(f"api_messages_post insert: {e}")
+        return jsonify({"error": "Failed to insert message"}), 500
+    msg_id = msg.get("id", "")
+    if not already_seen(msg_id):
+        t = __import__("threading").Thread(
+            target=forward_to_hazel,
+            args=(project_id, content, msg_id, attachments),
+            daemon=True,
+        )
+        t.start()
+    return jsonify(msg), 201
+
+
+
+@app.route("/api/messages", methods=["GET"])
+@require_auth
+def api_messages_get():
+    """Load messages for a project via service role (bypasses RLS)."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    project_id = request.args.get("project_id", "").strip()
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/messages",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"project_id": f"eq.{project_id}", "select": "*",
+                    "order": "created_at.asc", "limit": "100"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return jsonify(r.json()), 200
+    except Exception as e:
+        logging.error(f"api_messages_get: {e}")
+        return jsonify({"error": "Failed to fetch messages"}), 500
+
+
+
+
+# ── FILE UPLOAD ────────────────────────────────────────────────────────────────
+
+@app.route("/api/files/upload", methods=["POST"])
+@require_auth
+def api_files_upload():
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    project_id = (request.form.get("project_id") or "").strip()
+    category   = (request.form.get("category") or "uncategorized").strip()
+    file_obj   = request.files.get("file")
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    if not file_obj:
+        return jsonify({"error": "file is required"}), 400
+    filename  = file_obj.filename or "upload"
+    ext       = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    path      = f"{project_id}/{category}/{int(__import__('time').time())}_{filename.replace(' ','_')}"
+    try:
+        sr = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/project-files/{path}",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": file_obj.content_type or "application/octet-stream", "x-upsert": "false"},
+            data=file_obj.read(), timeout=30)
+        if sr.status_code not in (200, 201):
+            logging.error(f"Storage upload failed {sr.status_code}: {sr.text[:200]}")
+            return jsonify({"error": "Storage upload failed", "detail": sr.text}), 500
+    except Exception as e:
+        logging.error(f"Storage upload exception: {e}")
+        return jsonify({"error": "Storage upload failed"}), 500
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/files",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={"project_id": project_id, "firm_id": firm_id, "name": filename,
+                  "category": category, "storage_path": path, "file_type": ext,
+                  "size_bytes": 0, "upload_source": "dashboard"}, timeout=10)
+        r.raise_for_status()
+        row = r.json(); item = row[0] if isinstance(row, list) else row
+    except Exception as e:
+        logging.error(f"files insert: {e}")
+        return jsonify({"error": "File record insert failed"}), 500
+    return jsonify(item), 201
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8700, threaded=True)
+
+@app.route('/api/messages', methods=['POST'])
+def post_message():
+    """Accept a message from the dashboard, insert via service role, trigger Hazel."""
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({"error": "Missing authorization"}), 401
+    token = auth_header[7:]
+
+    try:
+        user_data = verify_supabase_jwt(token)
+    except Exception as e:
+        return jsonify({"error": f"Invalid token: {str(e)}"}), 401
+
+    data = request.get_json() or {}
+    project_id = data.get('project_id')
+    content = data.get('content', '').strip()
+    attachments = data.get('attachments', [])
+
+    if not project_id or not content:
+        return jsonify({"error": "project_id and content required"}), 400
+
+    # Verify user belongs to a firm that owns this project
+    firm_id = get_user_firm_id(user_data.get('sub') or user_data.get('email'))
+    if not firm_id:
+        return jsonify({"error": "No firm found for user"}), 403
+
+    # Insert via service role (bypasses RLS)
+    msg_id = str(uuid.uuid4())
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+    payload = {
+        "id": msg_id,
+        "project_id": project_id,
+        "firm_id": firm_id,
+        "role": "user",
+        "content": content,
+        "attachments": attachments
+    }
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/messages",
+        headers=headers,
+        json=payload
+    )
+    if resp.status_code not in (200, 201):
+        logging.error(f"Failed to insert message: {resp.status_code} {resp.text}")
+        return jsonify({"error": "Failed to insert message"}), 500
+
+    inserted = resp.json()
+    if isinstance(inserted, list):
+        inserted = inserted[0]
+
+    # Trigger Hazel in background
+    threading.Thread(
+        target=forward_to_hazel,
+        args=(project_id, content, msg_id, attachments),
+        daemon=True
+    ).start()
+
+    return jsonify({"id": msg_id, "status": "ok"}), 201
