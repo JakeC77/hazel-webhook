@@ -402,14 +402,108 @@ def webhook_email():
         f"\n--- Reply instructions ---\n"
         f"To reply:\n  python3 skills/boh-dashboard/scripts/send_email.py \\\n"
         f"    --thread-id {thread_id} \\\n    --to \"{sender}\" \\\n"
-        f"    --subject \"Re: {subject}\" \\\n    --text \"your reply here\"\n"
+        f"    --subject \"Re: {subject}\" \\\n    --text \"your reply here\" \\\n"
+        f"    --project-id <look up the project ID for this contact>\n"
         f"\nTo start a new email:\n  python3 skills/boh-dashboard/scripts/send_email.py \\\n"
-        f"    --to \"recipient@example.com\" --subject \"Subject\" --text \"body\"\n"
+        f"    --to \"recipient@example.com\" --subject \"Subject\" --text \"body\" \\\n"
+        f"    --project-id <project_id>\n"
+        f"\nIMPORTANT: Always include --project-id so the email is logged to outbound_emails.\n"
     )
     logging.info(f"Email from {sender} | thread={thread_id[:12]} | {subject[:60]}")
+
+    # Log to inbound_emails table (Epic 5: EM-01)
+    threading.Thread(
+        target=_log_inbound_email,
+        args=(sender, subject, body, message_id, thread_id),
+        daemon=True,
+    ).start()
+
     t = threading.Thread(target=lambda: post_to_hazel(session_key, message), daemon=True)
     t.start()
     return jsonify({"status": "queued"}), 200
+
+
+def _log_inbound_email(sender, subject, body, message_id, thread_id):
+    """Persist inbound email to Supabase. Resolves firm_id + project_id from contacts."""
+    try:
+        # Extract plain email from "Name <email>" format
+        sender_email = sender
+        if "<" in sender and ">" in sender:
+            sender_email = sender.split("<")[1].split(">")[0]
+        sender_name = sender.split("<")[0].strip().strip('"') if "<" in sender else None
+
+        # Resolve firm_id + project_id by matching sender against contacts
+        firm_id = None
+        project_id = None
+        try:
+            contact_r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/contacts",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"email": f"eq.{sender_email}", "select": "id,firm_id", "limit": "1"},
+                timeout=5,
+            )
+            if contact_r.ok and contact_r.json():
+                contact = contact_r.json()[0]
+                firm_id = contact.get("firm_id")
+                # Try to find a project for this contact
+                pc_r = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/project_contacts",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    params={"contact_id": f"eq.{contact['id']}", "select": "project_id", "limit": "1"},
+                    timeout=5,
+                )
+                if pc_r.ok and pc_r.json():
+                    project_id = pc_r.json()[0].get("project_id")
+        except Exception as e:
+            logging.warning(f"_log_inbound_email contact lookup: {e}")
+
+        # If no firm found via contacts, try to find any firm (single-tenant fallback)
+        if not firm_id:
+            try:
+                firms_r = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/firms",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    params={"select": "id", "limit": "1"},
+                    timeout=5,
+                )
+                if firms_r.ok and firms_r.json():
+                    firm_id = firms_r.json()[0]["id"]
+            except Exception:
+                pass
+
+        if not firm_id:
+            logging.warning(f"_log_inbound_email: no firm found for {sender_email}")
+            return
+
+        # Idempotency: check message_id
+        if message_id:
+            check = requests.get(
+                f"{SUPABASE_URL}/rest/v1/inbound_emails",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"message_id": f"eq.{message_id}", "select": "id", "limit": "1"},
+                timeout=5,
+            )
+            if check.ok and check.json():
+                return  # already logged
+
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/inbound_emails",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json={
+                "firm_id": firm_id,
+                "project_id": project_id,
+                "message_id": message_id or f"webhook-{thread_id}",
+                "thread_id": thread_id,
+                "from_email": sender_email,
+                "from_name": sender_name,
+                "subject": subject,
+                "body_text": body[:10000] if body else None,
+            },
+            timeout=5,
+        )
+        logging.info(f"Logged inbound email from {sender_email} to inbound_emails (firm={firm_id[:8] if firm_id else 'none'})")
+    except Exception as e:
+        logging.error(f"_log_inbound_email failed: {e}")
 
 
 
