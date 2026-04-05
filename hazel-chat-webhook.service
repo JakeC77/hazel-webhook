@@ -9,7 +9,7 @@ WorkingDirectory=/home/openclaw/hazel-chat-webhook
 ExecStart=/home/openclaw/hazel-chat-webhook/venv/bin/python server.py
 Restart=always
 RestartSec=5
-Environment=HAZEL_WEBHOOK_SECRET=hazel-chat-2026
+EnvironmentFile=/home/openclaw/hazel-chat-webhook/.env
 
 [Install]
 WantedBy=multi-user.target
