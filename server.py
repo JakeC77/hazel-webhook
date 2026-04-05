@@ -32,7 +32,7 @@ def add_cors(response):
     if origin in CORS_ORIGINS:
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
         response.headers['Vary'] = 'Origin'
     return response
 
@@ -1069,6 +1069,33 @@ def api_messages_get():
         return jsonify({"error": "Failed to fetch messages"}), 500
 
 
+
+
+# ── FILES ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/files", methods=["GET"])
+@require_auth
+def api_files_get():
+    """Load files for a project via service role (bypasses RLS)."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    project_id = request.args.get("project_id", "").strip()
+    if not project_id:
+        return jsonify({"error": "project_id is required"}), 400
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/files",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"project_id": f"eq.{project_id}", "select": "*",
+                    "order": "created_at.asc"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return jsonify(r.json()), 200
+    except Exception as e:
+        logging.error(f"api_files_get: {e}")
+        return jsonify({"error": "Failed to fetch files"}), 500
 
 
 # ── FILE UPLOAD ────────────────────────────────────────────────────────────────
