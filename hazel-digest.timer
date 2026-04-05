@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Hazel Daily Digest at 7:30am Pacific
+
+[Timer]
+OnCalendar=*-*-* 07:30:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target
