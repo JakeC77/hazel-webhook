@@ -32,7 +32,7 @@ def add_cors(response):
     if origin in CORS_ORIGINS:
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
         response.headers['Vary'] = 'Origin'
     return response
 
@@ -1458,6 +1458,76 @@ def api_files_upload():
         logging.error(f"files insert: {e}")
         return jsonify({"error": "File record insert failed"}), 500
     return jsonify(item), 201
+
+
+@app.route("/api/files/<file_id>", methods=["PATCH"])
+@require_auth
+def api_files_update(file_id):
+    """Update file metadata (category, archived, etc.) via service role."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    body = request.get_json(force=True) or {}
+    allowed = {"category", "archived", "archived_at"}
+    patch = {k: v for k, v in body.items() if k in allowed}
+    if not patch:
+        return jsonify({"error": "No valid fields to update"}), 400
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/files",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            params={"id": f"eq.{file_id}", "firm_id": f"eq.{firm_id}"},
+            json=patch,
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return jsonify(data[0] if data else {"status": "updated"}), 200
+    except Exception as e:
+        logging.error(f"api_files_update: {e}")
+        return jsonify({"error": "Failed to update file"}), 500
+
+
+@app.route("/api/files/<file_id>", methods=["DELETE"])
+@require_auth
+def api_files_delete(file_id):
+    """Delete file record and storage object via service role."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    try:
+        # Get storage_path before deleting
+        get_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/files",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{file_id}", "firm_id": f"eq.{firm_id}", "select": "storage_path", "limit": "1"},
+            timeout=5,
+        )
+        storage_path = None
+        if get_r.ok and get_r.json():
+            storage_path = get_r.json()[0].get("storage_path")
+
+        # Delete the DB record
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/files",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{file_id}", "firm_id": f"eq.{firm_id}"},
+            timeout=5,
+        )
+
+        # Delete from storage if path exists
+        if storage_path:
+            requests.delete(
+                f"{SUPABASE_URL}/storage/v1/object/project-files/{storage_path}",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+                timeout=10,
+            )
+
+        return jsonify({"status": "deleted"}), 200
+    except Exception as e:
+        logging.error(f"api_files_delete: {e}")
+        return jsonify({"error": "Failed to delete file"}), 500
+
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8700, threaded=True)
