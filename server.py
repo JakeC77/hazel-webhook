@@ -2533,6 +2533,62 @@ def api_gmail_renew_watches():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/api/lookup/phone", methods=["GET"])
+@require_auth
+def api_lookup_phone():
+    """Look up a user by phone number. Returns identity + Gmail status."""
+    import re
+    phone = request.args.get("number", "")
+    if not phone:
+        return jsonify({"error": "missing number param"}), 400
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    # Normalize to last 10 digits
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) > 10:
+        digits = digits[-10:]
+
+    result = {"phone": phone, "identified": False}
+
+    # Search contacts by phone (partial match on last 10 digits)
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/contacts",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "phone": f"ilike.%{digits}%", "select": "id,name,email,phone", "limit": "1"},
+        timeout=5,
+    )
+    if r.ok and r.json():
+        contact = r.json()[0]
+        result.update({"identified": True, "name": contact.get("name"), "email": contact.get("email"), "contact_id": contact["id"]})
+
+    # Check if this phone matches a firm_user (via their Supabase auth email → contacts)
+    # Also check Gmail status for the firm
+    gmail_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "select": "email,user_id", "limit": "10"},
+        timeout=5,
+    )
+    if gmail_r.ok and gmail_r.json():
+        gmail_rows = gmail_r.json()
+        # If we found a contact email, check if they have Gmail connected
+        contact_email = result.get("email", "")
+        for row in gmail_rows:
+            if contact_email and row.get("email", "").lower() == contact_email.lower():
+                result["gmail_connected"] = True
+                result["gmail_email"] = row["email"]
+                result["user_id"] = row.get("user_id")
+                break
+        else:
+            result["gmail_connected"] = False
+    else:
+        result["gmail_connected"] = False
+
+    return jsonify(result), 200
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EPIC 7 — BILLING AND COMMERCIAL INFRASTRUCTURE
 # ══════════════════════════════════════════════════════════════════════════════
