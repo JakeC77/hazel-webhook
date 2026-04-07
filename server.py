@@ -40,6 +40,11 @@ def add_cors(response):
 def api_preflight(subpath):
     """Handle CORS preflight for all /api/* routes."""
     return '', 204
+
+@app.route('/auth/<path:subpath>', methods=['OPTIONS'])
+def auth_preflight(subpath):
+    """Handle CORS preflight for all /auth/* routes."""
+    return '', 204
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 WEBHOOK_SECRET      = os.getenv("HAZEL_WEBHOOK_SECRET", "hazel-chat-2026")
