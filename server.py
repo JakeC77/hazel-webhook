@@ -2223,7 +2223,7 @@ def _match_gmail_project(email_data, firm_id):
     return None
 
 
-def _forward_gmail_to_hazel(firm_id, email_data):
+def _forward_gmail_to_hazel(firm_id, user_id, email_data):
     """Format a Gmail message and post to Hazel's OpenClaw session."""
     project_hint = _match_gmail_project(email_data, firm_id) or "unknown"
     message = (
@@ -2233,7 +2233,7 @@ def _forward_gmail_to_hazel(firm_id, email_data):
         f"{email_data['body']}\n\n"
         f"If this is relevant to a project, propose an action or draft a reply."
     )
-    session_key = f"hook:hazel:gmail:{firm_id}"
+    session_key = f"hook:hazel:gmail:{firm_id}:{user_id}"
     try:
         post_to_hazel(session_key, message)
         logging.info(f"Gmail forwarded to Hazel for firm {firm_id}: {email_data['subject'][:60]}")
@@ -2272,7 +2272,7 @@ def auth_gmail_start():
     if not GMAIL_CLIENT_ID:
         return jsonify({"error": "Gmail integration not configured"}), 503
     import urllib.parse
-    state = f"{g.firm_id}"
+    state = f"{g.firm_id}:{g.user_id}"
     auth_url = (
         "https://accounts.google.com/o/oauth2/v2/auth?"
         + urllib.parse.urlencode({
@@ -2294,10 +2294,15 @@ def auth_gmail_callback():
     from datetime import datetime, timezone, timedelta
     code = request.args.get("code")
     state = request.args.get("state", "")
-    firm_id = state
+    parts = state.split(":", 1)
+    firm_id = parts[0]
+    user_id = parts[1] if len(parts) > 1 else ""
 
     if not code:
         return "<h3>Authorization failed. Missing code.</h3>", 400
+
+    if not user_id:
+        return "<h3>Authorization failed. Missing user context.</h3>", 400
 
     # Exchange code for tokens
     token_r = requests.post(
@@ -2333,9 +2338,10 @@ def auth_gmail_callback():
     except Exception:
         pass
 
-    # Upsert token row
+    # Upsert token row (keyed on firm_id + user_id)
     row = {
         "firm_id": firm_id,
+        "user_id": user_id,
         "email": email,
         "access_token": _encrypt_token(access_token),
         "refresh_token": _encrypt_token(refresh_token),
@@ -2345,7 +2351,7 @@ def auth_gmail_callback():
     upd = requests.patch(
         f"{SUPABASE_URL}/rest/v1/gmail_tokens",
         headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
-        params={"firm_id": f"eq.{firm_id}"},
+        params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{user_id}"},
         json=row,
         timeout=5,
     )
@@ -2372,14 +2378,14 @@ def auth_gmail_callback():
 @app.route("/api/gmail/status", methods=["GET"])
 @require_auth
 def api_gmail_status():
-    """Get Gmail connection status for the firm."""
+    """Get Gmail connection status for the current user."""
     firm_id = g.firm_id
     if not firm_id:
         return jsonify({"error": "No firm found"}), 404
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/gmail_tokens",
         headers={**SB_HEADERS, "Content-Type": "application/json"},
-        params={"firm_id": f"eq.{firm_id}", "select": "email,watch_expiry,created_at", "limit": "1"},
+        params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{g.user_id}", "select": "email,watch_expiry,created_at", "limit": "1"},
         timeout=5,
     )
     if r.ok and r.json():
@@ -2391,7 +2397,7 @@ def api_gmail_status():
 @app.route("/api/gmail/disconnect", methods=["DELETE"])
 @require_auth
 def api_gmail_disconnect():
-    """Disconnect Gmail. Revokes token with Google and deletes the row."""
+    """Disconnect Gmail for the current user. Revokes token and deletes the row."""
     firm_id = g.firm_id
     if not firm_id:
         return jsonify({"error": "No firm found"}), 404
@@ -2400,7 +2406,7 @@ def api_gmail_disconnect():
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/gmail_tokens",
         headers={**SB_HEADERS, "Content-Type": "application/json"},
-        params={"firm_id": f"eq.{firm_id}", "select": "access_token,refresh_token", "limit": "1"},
+        params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{g.user_id}", "select": "access_token,refresh_token", "limit": "1"},
         timeout=5,
     )
     if r.ok and r.json():
@@ -2415,13 +2421,13 @@ def api_gmail_disconnect():
                     timeout=10,
                 )
             except Exception as e:
-                logging.warning(f"Gmail revoke failed for firm {firm_id}: {e}")
+                logging.warning(f"Gmail revoke failed for user {g.user_id} firm {firm_id}: {e}")
 
     # Delete row
     requests.delete(
         f"{SUPABASE_URL}/rest/v1/gmail_tokens",
         headers={**SB_HEADERS, "Content-Type": "application/json"},
-        params={"firm_id": f"eq.{firm_id}"},
+        params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{g.user_id}"},
         timeout=5,
     )
     return jsonify({"connected": False}), 200
@@ -2461,7 +2467,7 @@ def webhook_gmail_push():
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/gmail_tokens",
         headers={**SB_HEADERS, "Content-Type": "application/json"},
-        params={"email": f"eq.{email_address}", "select": "firm_id,access_token,refresh_token,expiry,history_id", "limit": "1"},
+        params={"email": f"eq.{email_address}", "select": "firm_id,user_id,access_token,refresh_token,expiry,history_id", "limit": "1"},
         timeout=5,
     )
     if not r.ok or not r.json():
@@ -2470,6 +2476,7 @@ def webhook_gmail_push():
 
     token_row = r.json()[0]
     firm_id = token_row["firm_id"]
+    user_id = token_row.get("user_id", "")
     old_history_id = token_row.get("history_id", "")
 
     if not old_history_id:
@@ -2477,7 +2484,7 @@ def webhook_gmail_push():
         requests.patch(
             f"{SUPABASE_URL}/rest/v1/gmail_tokens",
             headers={**SB_HEADERS, "Content-Type": "application/json"},
-            params={"firm_id": f"eq.{firm_id}"},
+            params={"email": f"eq.{email_address}"},
             json={"history_id": new_history_id, "updated_at": json.dumps(None)},
             timeout=5,
         )
@@ -2498,7 +2505,7 @@ def webhook_gmail_push():
             requests.patch(
                 f"{SUPABASE_URL}/rest/v1/gmail_tokens",
                 headers={**SB_HEADERS, "Content-Type": "application/json"},
-                params={"firm_id": f"eq.{firm_id}"},
+                params={"email": f"eq.{email_address}"},
                 json={"history_id": new_history_id, "updated_at": datetime.now(timezone.utc).isoformat()},
                 timeout=5,
             )
@@ -2508,9 +2515,9 @@ def webhook_gmail_push():
                     continue
                 email_data = _get_gmail_message(access_token, msg_id)
                 if email_data:
-                    _forward_gmail_to_hazel(firm_id, email_data)
+                    _forward_gmail_to_hazel(firm_id, user_id, email_data)
         except Exception as e:
-            logging.error(f"gmail-push processing error for firm {firm_id}: {e}")
+            logging.error(f"gmail-push processing error for firm {firm_id} user {user_id}: {e}")
 
     threading.Thread(target=_process, daemon=True).start()
     return "", 204
