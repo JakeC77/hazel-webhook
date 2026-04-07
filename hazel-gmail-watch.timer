@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew Gmail watches daily at 3am Pacific
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target

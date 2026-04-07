@@ -1,0 +1,12 @@
+[Unit]
+Description=Hazel Gmail Watch Renewal
+After=network.target hazel-chat-webhook.service
+
+[Service]
+Type=oneshot
+User=openclaw
+WorkingDirectory=/home/openclaw/hazel-chat-webhook
+EnvironmentFile=/etc/systemd/system/hazel-chat-webhook.service.env
+ExecStart=/usr/bin/curl -s -X POST http://127.0.0.1:8700/api/gmail/renew-watches -H "X-Webhook-Secret: hazel-chat-2026"
+StandardOutput=journal
+StandardError=journal

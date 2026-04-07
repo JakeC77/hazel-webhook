@@ -2040,6 +2040,488 @@ def api_milestones(project_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GMAIL REAL-TIME INBOX INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+GMAIL_CLIENT_ID       = os.getenv("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SECRET   = os.getenv("GMAIL_CLIENT_SECRET", "")
+GMAIL_REDIRECT_URI    = os.getenv("GMAIL_REDIRECT_URI", "https://hazel.dejaview.io/auth/gmail/callback")
+GMAIL_PUBSUB_TOPIC    = os.getenv("GMAIL_PUBSUB_TOPIC", "")
+GMAIL_PUBSUB_SECRET   = os.getenv("GMAIL_PUBSUB_WEBHOOK_SECRET", "")
+
+
+def _refresh_gmail_token(firm_id, token_row):
+    """Refresh Gmail access token using stored refresh_token. Returns new access_token or None."""
+    from datetime import datetime, timezone, timedelta
+    refresh_token = _decrypt_token(token_row.get("refresh_token", ""))
+    if not refresh_token:
+        return None
+    r = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GMAIL_CLIENT_ID,
+            "client_secret": GMAIL_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+        timeout=10,
+    )
+    if r.ok:
+        tokens = r.json()
+        expires_in = tokens.get("expires_in", 3600)
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json={
+                "access_token": _encrypt_token(tokens["access_token"]),
+                "expiry": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            timeout=5,
+        )
+        return tokens["access_token"]
+    else:
+        logging.error(f"Gmail token refresh failed for firm {firm_id}: {r.status_code} {r.text[:200]}")
+        return None
+
+
+def _get_gmail_access_token(firm_id, token_row):
+    """Return a valid access token, refreshing if needed."""
+    from datetime import datetime, timezone, timedelta
+    expiry_str = token_row.get("expiry")
+    if expiry_str:
+        from dateutil.parser import parse as parse_dt
+        expiry = parse_dt(expiry_str)
+        if expiry > datetime.now(timezone.utc) + timedelta(minutes=5):
+            return _decrypt_token(token_row.get("access_token", ""))
+    return _refresh_gmail_token(firm_id, token_row)
+
+
+def _register_gmail_watch(firm_id, access_token):
+    """Register Gmail push notification watch via Pub/Sub. Returns historyId or None."""
+    from datetime import datetime, timezone, timedelta
+    if not GMAIL_PUBSUB_TOPIC:
+        logging.error("GMAIL_PUBSUB_TOPIC not configured")
+        return None
+    r = requests.post(
+        "https://gmail.googleapis.com/gmail/v1/users/me/watch",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={"topicName": GMAIL_PUBSUB_TOPIC, "labelIds": ["INBOX"]},
+        timeout=10,
+    )
+    if r.ok:
+        result = r.json()
+        history_id = result.get("historyId")
+        expiration_ms = int(result.get("expiration", 0))
+        watch_expiry = datetime.fromtimestamp(expiration_ms / 1000, tz=timezone.utc).isoformat() if expiration_ms else (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json={"history_id": history_id, "watch_expiry": watch_expiry, "updated_at": datetime.now(timezone.utc).isoformat()},
+            timeout=5,
+        )
+        logging.info(f"Gmail watch registered for firm {firm_id}, historyId={history_id}")
+        return history_id
+    else:
+        logging.error(f"Gmail watch registration failed for firm {firm_id}: {r.status_code} {r.text[:200]}")
+        return None
+
+
+def _fetch_new_gmail_messages(access_token, old_history_id, new_history_id):
+    """Fetch new INBOX messages since old_history_id using Gmail history API."""
+    messages = []
+    try:
+        r = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/history",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"startHistoryId": old_history_id, "historyTypes": "messageAdded", "labelId": "INBOX"},
+            timeout=10,
+        )
+        if not r.ok:
+            logging.warning(f"Gmail history.list failed: {r.status_code} {r.text[:200]}")
+            return messages
+        history = r.json().get("history", [])
+        seen_ids = set()
+        for entry in history:
+            for msg_added in entry.get("messagesAdded", []):
+                msg = msg_added.get("message", {})
+                msg_id = msg.get("id")
+                labels = msg.get("labelIds", [])
+                if msg_id and msg_id not in seen_ids and "INBOX" in labels and "SENT" not in labels:
+                    seen_ids.add(msg_id)
+                    messages.append(msg_id)
+    except Exception as e:
+        logging.error(f"_fetch_new_gmail_messages error: {e}")
+    return messages
+
+
+def _get_gmail_message(access_token, message_id):
+    """Fetch a single Gmail message and return parsed {from, subject, body}."""
+    import base64
+    r = requests.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"format": "full"},
+        timeout=10,
+    )
+    if not r.ok:
+        return None
+    data = r.json()
+    headers = {h["name"].lower(): h["value"] for h in data.get("payload", {}).get("headers", [])}
+    sender = headers.get("from", "unknown")
+    subject = headers.get("subject", "(no subject)")
+
+    # Extract body — prefer plain text, fall back to html snippet
+    body = ""
+    payload = data.get("payload", {})
+
+    def _extract_text(part):
+        if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+            return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+        for sub in part.get("parts", []):
+            result = _extract_text(sub)
+            if result:
+                return result
+        return ""
+
+    body = _extract_text(payload) or data.get("snippet", "")
+    return {"from": sender, "subject": subject, "body": body[:3000]}
+
+
+def _match_gmail_project(email_data, firm_id):
+    """Try to match an email sender to a known contact/project."""
+    sender = email_data.get("from", "")
+    # Extract email address from "Name <email>" format
+    import re
+    match = re.search(r'<([^>]+)>', sender)
+    email_addr = match.group(1) if match else sender
+
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/contacts",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "email": f"ilike.{email_addr}", "select": "id,name,email", "limit": "1"},
+        timeout=5,
+    )
+    if r.ok and r.json():
+        contact = r.json()[0]
+        # Check project_contacts for a linked project
+        pc = requests.get(
+            f"{SUPABASE_URL}/rest/v1/project_contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"contact_id": f"eq.{contact['id']}", "select": "project_id", "limit": "1"},
+            timeout=5,
+        )
+        if pc.ok and pc.json():
+            return contact["name"]
+    return None
+
+
+def _forward_gmail_to_hazel(firm_id, email_data):
+    """Format a Gmail message and post to Hazel's OpenClaw session."""
+    project_hint = _match_gmail_project(email_data, firm_id) or "unknown"
+    message = (
+        f"[Inbound email — {email_data['from']}]\n"
+        f"Subject: {email_data['subject']}\n"
+        f"Project hint: {project_hint}\n\n"
+        f"{email_data['body']}\n\n"
+        f"If this is relevant to a project, propose an action or draft a reply."
+    )
+    session_key = f"hook:hazel:gmail:{firm_id}"
+    try:
+        post_to_hazel(session_key, message)
+        logging.info(f"Gmail forwarded to Hazel for firm {firm_id}: {email_data['subject'][:60]}")
+    except Exception as e:
+        logging.error(f"Failed to forward Gmail to Hazel for firm {firm_id}: {e}")
+
+
+def renew_gmail_watches():
+    """Renew Gmail watches that are expiring within 24 hours."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"watch_expiry": f"lt.{cutoff}", "select": "firm_id,access_token,refresh_token,expiry"},
+        timeout=5,
+    )
+    if not r.ok:
+        logging.error(f"renew_gmail_watches: failed to query gmail_tokens: {r.status_code}")
+        return
+    for row in r.json():
+        firm_id = row["firm_id"]
+        access_token = _get_gmail_access_token(firm_id, row)
+        if access_token:
+            _register_gmail_watch(firm_id, access_token)
+        else:
+            logging.warning(f"renew_gmail_watches: could not get access token for firm {firm_id}")
+
+
+# ── Gmail OAuth Routes ────────────────────────────────────────────────────────
+
+@app.route("/auth/gmail/start", methods=["GET"])
+@require_auth
+def auth_gmail_start():
+    """Start Gmail OAuth flow. Returns the Google authorization URL."""
+    if not GMAIL_CLIENT_ID:
+        return jsonify({"error": "Gmail integration not configured"}), 503
+    import urllib.parse
+    state = f"{g.firm_id}"
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        + urllib.parse.urlencode({
+            "client_id": GMAIL_CLIENT_ID,
+            "response_type": "code",
+            "scope": "https://www.googleapis.com/auth/gmail.readonly",
+            "access_type": "offline",
+            "prompt": "consent",
+            "redirect_uri": GMAIL_REDIRECT_URI,
+            "state": state,
+        })
+    )
+    return jsonify({"auth_url": auth_url}), 200
+
+
+@app.route("/auth/gmail/callback", methods=["GET"])
+def auth_gmail_callback():
+    """Gmail OAuth callback. Exchanges code for tokens, registers watch."""
+    from datetime import datetime, timezone, timedelta
+    code = request.args.get("code")
+    state = request.args.get("state", "")
+    firm_id = state
+
+    if not code:
+        return "<h3>Authorization failed. Missing code.</h3>", 400
+
+    # Exchange code for tokens
+    token_r = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": GMAIL_CLIENT_ID,
+            "client_secret": GMAIL_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": GMAIL_REDIRECT_URI,
+        },
+        timeout=10,
+    )
+    if not token_r.ok:
+        logging.error(f"Gmail token exchange failed: {token_r.status_code} {token_r.text[:200]}")
+        return "<h3>Failed to connect Gmail. Please try again.</h3>", 500
+
+    tokens = token_r.json()
+    access_token = tokens["access_token"]
+    refresh_token = tokens.get("refresh_token", "")
+    expires_in = tokens.get("expires_in", 3600)
+
+    # Get user's email address
+    email = ""
+    try:
+        profile_r = requests.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        if profile_r.ok:
+            email = profile_r.json().get("emailAddress", "")
+    except Exception:
+        pass
+
+    # Upsert token row
+    row = {
+        "firm_id": firm_id,
+        "email": email,
+        "access_token": _encrypt_token(access_token),
+        "refresh_token": _encrypt_token(refresh_token),
+        "expiry": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    upd = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        params={"firm_id": f"eq.{firm_id}"},
+        json=row,
+        timeout=5,
+    )
+    if not upd.ok or not upd.json():
+        row["created_at"] = datetime.now(timezone.utc).isoformat()
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json=row,
+            timeout=5,
+        )
+
+    # Register Gmail watch
+    _register_gmail_watch(firm_id, access_token)
+
+    return (
+        '<html><body><h3>Gmail connected successfully!</h3>'
+        '<p>You can close this window and return to the Hazel dashboard.</p>'
+        '<script>window.opener && window.opener.postMessage("gmail_connected","*"); setTimeout(()=>window.close(),2000);</script>'
+        '</body></html>'
+    )
+
+
+@app.route("/api/gmail/status", methods=["GET"])
+@require_auth
+def api_gmail_status():
+    """Get Gmail connection status for the firm."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "select": "email,watch_expiry,created_at", "limit": "1"},
+        timeout=5,
+    )
+    if r.ok and r.json():
+        row = r.json()[0]
+        return jsonify({"connected": True, "email": row["email"], "watch_expiry": row.get("watch_expiry"), "connected_at": row.get("created_at")}), 200
+    return jsonify({"connected": False}), 200
+
+
+@app.route("/api/gmail/disconnect", methods=["DELETE"])
+@require_auth
+def api_gmail_disconnect():
+    """Disconnect Gmail. Revokes token with Google and deletes the row."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    # Fetch token to revoke
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "select": "access_token,refresh_token", "limit": "1"},
+        timeout=5,
+    )
+    if r.ok and r.json():
+        row = r.json()[0]
+        token_to_revoke = _decrypt_token(row.get("refresh_token") or row.get("access_token", ""))
+        if token_to_revoke:
+            try:
+                requests.post(
+                    "https://oauth2.googleapis.com/revoke",
+                    params={"token": token_to_revoke},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=10,
+                )
+            except Exception as e:
+                logging.warning(f"Gmail revoke failed for firm {firm_id}: {e}")
+
+    # Delete row
+    requests.delete(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}"},
+        timeout=5,
+    )
+    return jsonify({"connected": False}), 200
+
+
+# ── Gmail Pub/Sub Webhook ─────────────────────────────────────────────────────
+
+@app.route("/webhook/gmail-push", methods=["POST"])
+def webhook_gmail_push():
+    """Receive Gmail push notifications from Google Pub/Sub."""
+    import base64 as b64
+
+    # Optional shared-secret verification
+    if GMAIL_PUBSUB_SECRET:
+        provided = request.args.get("secret", "") or request.headers.get("X-Webhook-Secret", "")
+        if provided != GMAIL_PUBSUB_SECRET:
+            return "", 403
+
+    data = request.get_json(force=True) or {}
+    message_data = data.get("message", {}).get("data", "")
+    if not message_data:
+        return "", 204
+
+    try:
+        payload = json.loads(b64.b64decode(message_data))
+    except Exception as e:
+        logging.warning(f"gmail-push: bad payload: {e}")
+        return "", 400
+
+    email_address = payload.get("emailAddress", "")
+    new_history_id = str(payload.get("historyId", ""))
+
+    if not email_address:
+        return "", 204
+
+    # Look up firm by email
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"email": f"eq.{email_address}", "select": "firm_id,access_token,refresh_token,expiry,history_id", "limit": "1"},
+        timeout=5,
+    )
+    if not r.ok or not r.json():
+        logging.info(f"gmail-push: no token for {email_address}")
+        return "", 204
+
+    token_row = r.json()[0]
+    firm_id = token_row["firm_id"]
+    old_history_id = token_row.get("history_id", "")
+
+    if not old_history_id:
+        # First push after watch registration — just store the history_id
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json={"history_id": new_history_id, "updated_at": json.dumps(None)},
+            timeout=5,
+        )
+        return "", 204
+
+    # Get valid access token
+    access_token = _get_gmail_access_token(firm_id, token_row)
+    if not access_token:
+        logging.error(f"gmail-push: no valid token for firm {firm_id}")
+        return "", 204
+
+    # Process in background thread
+    def _process():
+        try:
+            msg_ids = _fetch_new_gmail_messages(access_token, old_history_id, new_history_id)
+            # Update history_id
+            from datetime import datetime, timezone
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"firm_id": f"eq.{firm_id}"},
+                json={"history_id": new_history_id, "updated_at": datetime.now(timezone.utc).isoformat()},
+                timeout=5,
+            )
+            for msg_id in msg_ids:
+                dedup_key = f"gmail:{msg_id}"
+                if already_seen(dedup_key):
+                    continue
+                email_data = _get_gmail_message(access_token, msg_id)
+                if email_data:
+                    _forward_gmail_to_hazel(firm_id, email_data)
+        except Exception as e:
+            logging.error(f"gmail-push processing error for firm {firm_id}: {e}")
+
+    threading.Thread(target=_process, daemon=True).start()
+    return "", 204
+
+
+@app.route("/api/gmail/renew-watches", methods=["POST"])
+def api_gmail_renew_watches():
+    """Endpoint for cron to trigger watch renewal. Protected by webhook secret."""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    renew_gmail_watches()
+    return jsonify({"status": "ok"}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # EPIC 7 — BILLING AND COMMERCIAL INFRASTRUCTURE
 # ══════════════════════════════════════════════════════════════════════════════
 
