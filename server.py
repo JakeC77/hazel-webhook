@@ -68,6 +68,42 @@ SB_HEADERS          = {
 HOME_PROJECT_ID = "a0000000-0000-0000-0000-000000000000"
 SETUP_TRIGGER   = "[NEW_PROJECT_SETUP]"
 
+# ── Multi-agent routing ──────────────────────────────────────────────────────
+# Maps firm_id → OpenClaw agent_id. For single-agent setups this always returns
+# "hazel". For multi-tenant, it resolves to "hazel-{slug}" by querying the firms
+# table for a slug or display_name.
+#
+# Results are cached in-memory to avoid a DB round-trip on every message.
+
+_agent_id_cache = {}
+
+def get_agent_id_for_firm(firm_id):
+    """Resolve a firm_id to its OpenClaw agent_id. Cached."""
+    if not firm_id:
+        return "hazel"
+    if firm_id in _agent_id_cache:
+        return _agent_id_cache[firm_id]
+
+    agent_id = "hazel"  # default fallback
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}", "select": "agent_id,display_name", "limit": "1"},
+            timeout=5,
+        )
+        if r.ok and r.json():
+            row = r.json()[0]
+            # Use explicit agent_id column if set, otherwise derive from display_name
+            if row.get("agent_id"):
+                agent_id = row["agent_id"]
+            # If no agent_id column yet, fall back to "hazel" (single-agent mode)
+    except Exception as e:
+        logging.warning(f"get_agent_id_for_firm({firm_id}): {e}")
+
+    _agent_id_cache[firm_id] = agent_id
+    return agent_id
+
 _seen = set()
 _seen_lock = threading.Lock()
 
@@ -149,7 +185,7 @@ def get_project_info(project_id):
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/projects",
             headers=SB_HEADERS,
-            params={"id": f"eq.{project_id}", "select": "name,pm_name,graph_project_id,status"},
+            params={"id": f"eq.{project_id}", "select": "name,pm_name,graph_project_id,status,firm_id"},
             timeout=5,
         )
         r.raise_for_status()
@@ -161,6 +197,7 @@ def get_project_info(project_id):
                 "pm_name": p.get("pm_name", "Builder"),
                 "graph_project_id": p.get("graph_project_id"),
                 "status": p.get("status"),
+                "firm_id": p.get("firm_id"),
             }
     except Exception as e:
         logging.warning(f"Could not fetch project info: {e}")
@@ -239,7 +276,7 @@ def build_file_context(project_id, message_attachments):
             lines.append("")
     return "\n".join(lines) if lines else ""
 
-def post_to_hazel(session_key, message):
+def post_to_hazel(session_key, message, agent_id="hazel"):
     r = requests.post(
         f"{OPENCLAW_URL}/hooks/agent",
         headers={
@@ -249,7 +286,7 @@ def post_to_hazel(session_key, message):
         json={
             "message": message,
             "name": "Dashboard",
-            "agentId": "hazel",
+            "agentId": agent_id,
             "sessionKey": session_key,
             "deliver": False,
             "wakeMode": "now",
@@ -258,8 +295,9 @@ def post_to_hazel(session_key, message):
     )
     r.raise_for_status()
 
-def forward_home(content, msg_id):
+def forward_home(content, msg_id, firm_id=None):
     try:
+        agent_id = get_agent_id_for_firm(firm_id)
         session_key = "hook:hazel:dashboard:home"
         message = (
             "[Home channel message — account-level]\n"
@@ -269,13 +307,14 @@ def forward_home(content, msg_id):
             "To reply, use: python3 skills/boh-dashboard/scripts/send_message.py --home --message \"...\"\n\n"
             + content
         )
-        post_to_hazel(session_key, message)
-        logging.info(f"Forwarded to hazel home: {content[:80]}")
+        post_to_hazel(session_key, message, agent_id=agent_id)
+        logging.info(f"Forwarded to {agent_id} home: {content[:80]}")
     except Exception:
         logging.exception(f"Failed to forward home message {msg_id} to hazel")
 
-def forward_setup(project_id, msg_id):
+def forward_setup(project_id, msg_id, firm_id=None):
     try:
+        agent_id = get_agent_id_for_firm(firm_id)
         session_key = f"hook:hazel:dashboard:{project_id}"
         message = (
             f"[New project setup — Supabase ID: {project_id}]\n"
@@ -303,23 +342,33 @@ def forward_setup(project_id, msg_id):
             f"Reply via: python3 skills/boh-dashboard/scripts/send_message.py --project-id {project_id} --message \"...\"\n\n"
             "Start now — greet them and ask for the project name."
         )
-        post_to_hazel(session_key, message)
-        logging.info(f"New project setup triggered for {project_id[:8]}")
+        post_to_hazel(session_key, message, agent_id=agent_id)
+        logging.info(f"New project setup triggered for {project_id[:8]} agent={agent_id}")
     except Exception:
         logging.exception(f"Failed to trigger project setup for {msg_id}")
 
 def forward_to_hazel(project_id, content, msg_id, message_attachments):
+    # Look up firm_id from project for agent routing
+    firm_id = None
+    try:
+        info = get_project_info(project_id)
+        firm_id = info.get("firm_id")
+    except Exception:
+        pass
+
     if project_id == HOME_PROJECT_ID:
-        forward_home(content, msg_id)
+        forward_home(content, msg_id, firm_id=firm_id)
         return
     if content.strip() == SETUP_TRIGGER:
-        forward_setup(project_id, msg_id)
+        forward_setup(project_id, msg_id, firm_id=firm_id)
         return
     try:
-        info         = get_project_info(project_id)
+        if not info:
+            info = get_project_info(project_id)
         project_name = info["name"]
         pm_name      = info["pm_name"]
         graph_id     = info["graph_project_id"]
+        agent_id     = get_agent_id_for_firm(firm_id)
         session_key  = f"hook:hazel:dashboard:{project_id}"
         graph_line   = f"Graph Project ID: {graph_id}" if graph_id else "Graph Project ID: (not linked — query by project name)"
         file_context = build_file_context(project_id, message_attachments)
@@ -331,8 +380,8 @@ def forward_to_hazel(project_id, content, msg_id, message_attachments):
         if file_context:
             message += file_context + "\n"
         message += content
-        post_to_hazel(session_key, message)
-        logging.info(f"Forwarded to hazel ({project_id[:8]}): {content[:80]}")
+        post_to_hazel(session_key, message, agent_id=agent_id)
+        logging.info(f"Forwarded to {agent_id} ({project_id[:8]}): {content[:80]}")
     except Exception:
         logging.exception(f"Failed to forward message {msg_id} to hazel")
 
@@ -423,6 +472,7 @@ def webhook_email():
         daemon=True,
     ).start()
 
+    # Email webhook — no firm_id available, use default agent
     t = threading.Thread(target=lambda: post_to_hazel(session_key, message), daemon=True)
     t.start()
     return jsonify({"status": "queued"}), 200
@@ -2233,10 +2283,11 @@ def _forward_gmail_to_hazel(firm_id, user_id, email_data):
         f"{email_data['body']}\n\n"
         f"If this is relevant to a project, propose an action or draft a reply."
     )
+    agent_id = get_agent_id_for_firm(firm_id)
     session_key = f"hook:hazel:gmail:{firm_id}:{user_id}"
     try:
-        post_to_hazel(session_key, message)
-        logging.info(f"Gmail forwarded to Hazel for firm {firm_id}: {email_data['subject'][:60]}")
+        post_to_hazel(session_key, message, agent_id=agent_id)
+        logging.info(f"Gmail forwarded to {agent_id} for firm {firm_id}: {email_data['subject'][:60]}")
     except Exception as e:
         logging.error(f"Failed to forward Gmail to Hazel for firm {firm_id}: {e}")
 
