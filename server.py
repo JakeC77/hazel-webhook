@@ -742,6 +742,77 @@ VALID_TRANSITIONS = {
     "snoozed": {"approve", "reject", "hold", "reactivate"},
 }
 
+def _execute_approved_email(item, user_id, firm_id):
+    """Execute an approved email draft — send via Gmail if connected, else log for manual send.
+
+    Called in a background thread after a queue item of type 'email' is approved.
+    Extracts to/subject/body from the structured draft and sends via the approver's Gmail.
+    """
+    from datetime import datetime, timezone
+    try:
+        draft = item.get("current_draft", "")
+        draft_type = item.get("draft_type", "plaintext")
+        project_id = item.get("project_id")
+        item_id = item.get("id")
+
+        # Parse structured draft
+        if draft_type == "structured" and isinstance(draft, str):
+            try:
+                draft = json.loads(draft)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if isinstance(draft, dict):
+            to = draft.get("to", "")
+            subject = draft.get("subject", "")
+            body = draft.get("body", "")
+            cc = draft.get("cc", "")
+            in_reply_to = draft.get("in_reply_to", "")
+        else:
+            # Plaintext draft — can't auto-send without structured fields
+            logging.info(f"_execute_approved_email: item {item_id} is plaintext, skipping auto-send")
+            return
+
+        if not to or not body:
+            logging.warning(f"_execute_approved_email: item {item_id} missing to or body")
+            return
+
+        # Try Gmail send
+        gmail_result = None
+        try:
+            gmail_result = _send_gmail(user_id, firm_id, to, subject, body, cc=cc or None, in_reply_to=in_reply_to or None)
+        except Exception as e:
+            logging.warning(f"_execute_approved_email: Gmail send failed for item {item_id}: {e}")
+
+        # Log to outbound_emails
+        send_via = "gmail" if gmail_result else "pending"
+        outbound = {
+            "firm_id": firm_id,
+            "project_id": project_id,
+            "queue_item_id": item_id,
+            "to_email": to,
+            "subject": subject,
+            "body": body,
+            "send_status": "sent" if gmail_result else "queued",
+            "send_via": send_via,
+            "sent_at": datetime.now(timezone.utc).isoformat() if gmail_result else None,
+        }
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/outbound_emails",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json=outbound,
+            timeout=5,
+        )
+
+        if gmail_result:
+            logging.info(f"_execute_approved_email: sent via Gmail for item {item_id} from {gmail_result['sender']}")
+        else:
+            logging.info(f"_execute_approved_email: Gmail not available for item {item_id}, logged as pending")
+
+    except Exception as e:
+        logging.error(f"_execute_approved_email error for item {item.get('id')}: {e}")
+
+
 @app.route("/api/queue/<item_id>/decide", methods=["POST"])
 @require_auth
 def api_queue_decide(item_id):
@@ -762,7 +833,7 @@ def api_queue_decide(item_id):
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/queue_items",
             headers={**SB_HEADERS},
-            params={"id": f"eq.{item_id}", "select": "id,status,project_id,firm_id", "limit": "1"},
+            params={"id": f"eq.{item_id}", "select": "id,status,project_id,firm_id,type,current_draft,draft_type", "limit": "1"},
             timeout=5,
         )
         r.raise_for_status()
@@ -809,7 +880,17 @@ def api_queue_decide(item_id):
         )
         upd.raise_for_status()
         updated = upd.json()
-        return jsonify(updated[0] if updated else {"id": item_id, **patch}), 200
+        result = updated[0] if updated else {"id": item_id, **patch}
+
+        # ── Post-approve: auto-send email via Gmail if applicable ─────────
+        if action == "approve" and item.get("type") == "email":
+            threading.Thread(
+                target=_execute_approved_email,
+                args=(item, g.user_id, firm_id),
+                daemon=True,
+            ).start()
+
+        return jsonify(result), 200
 
     except Exception as e:
         logging.error(f"api_queue_decide: {e}")
@@ -2263,6 +2344,67 @@ def renew_gmail_watches():
             logging.warning(f"renew_gmail_watches: could not get access token for firm {firm_id}")
 
 
+# ── Gmail Send Helper ─────────────────────────────────────────────────────────
+
+def _send_gmail(user_id, firm_id, to, subject, body, cc=None, in_reply_to=None):
+    """Send an email via Gmail API using the user's OAuth tokens.
+
+    Returns dict with {message_id, thread_id} on success, raises on failure.
+    Called from the queue approval handler — never directly by the agent.
+    """
+    import base64
+    from email.mime.text import MIMEText
+    from datetime import datetime, timezone
+
+    # Look up tokens
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{user_id}", "select": "email,access_token,refresh_token,expiry", "limit": "1"},
+        timeout=5,
+    )
+    if not r.ok or not r.json():
+        raise ValueError(f"No Gmail tokens found for user {user_id} in firm {firm_id}")
+
+    token_row = r.json()[0]
+    sender_email = token_row["email"]
+    access_token = _get_gmail_access_token(firm_id, token_row)
+    if not access_token:
+        raise ValueError(f"Could not get valid Gmail access token for {sender_email}")
+
+    # Build MIME message
+    msg = MIMEText(body, "plain")
+    msg["To"] = to
+    msg["From"] = sender_email
+    msg["Subject"] = subject
+    if cc:
+        msg["Cc"] = cc
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+
+    raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+    # Send via Gmail API
+    send_r = requests.post(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json={"raw": raw_message},
+        timeout=15,
+    )
+    if not send_r.ok:
+        raise ValueError(f"Gmail send failed: {send_r.status_code} {send_r.text[:200]}")
+
+    result = send_r.json()
+    logging.info(f"Gmail sent from {sender_email} to {to}: subject={subject[:60]}")
+
+    return {
+        "message_id": result.get("id", ""),
+        "thread_id": result.get("threadId", ""),
+        "sender": sender_email,
+    }
+
+
 # ── Gmail OAuth Routes ────────────────────────────────────────────────────────
 
 @app.route("/auth/gmail/start", methods=["GET"])
@@ -2278,7 +2420,7 @@ def auth_gmail_start():
         + urllib.parse.urlencode({
             "client_id": GMAIL_CLIENT_ID,
             "response_type": "code",
-            "scope": "https://www.googleapis.com/auth/gmail.readonly",
+            "scope": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
             "access_type": "offline",
             "prompt": "consent",
             "redirect_uri": GMAIL_REDIRECT_URI,
