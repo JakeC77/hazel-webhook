@@ -2670,6 +2670,12 @@ def billing_webhook():
 
         if event_type == "customer.subscription.created":
             _upsert_subscription(firm_id, obj)
+            # Auto-provision agent if subscription is active/trialing
+            sub_status = obj.get("status", "")
+            if firm_id and sub_status in ("active", "trialing"):
+                threading.Thread(
+                    target=_auto_provision_agent, args=(firm_id,), daemon=True
+                ).start()
         elif event_type == "customer.subscription.updated":
             _upsert_subscription(firm_id, obj)
         elif event_type == "customer.subscription.deleted":
@@ -2778,6 +2784,90 @@ def _handle_payment_failed(firm_id, invoice_obj):
         json={"status": "past_due", "grace_period_ends_at": grace_end, "updated_at": datetime.now(timezone.utc).isoformat()},
         timeout=5,
     )
+
+
+def _auto_provision_agent(firm_id):
+    """Auto-provision a Hazel agent when a firm's subscription becomes active.
+
+    Called asynchronously from the Stripe webhook on subscription.created.
+    Checks if the firm already has an agent_id; if so, skips.
+    Otherwise, calls the provisioning script in a subprocess.
+    """
+    import subprocess, re
+    try:
+        # Check if firm already has an agent
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}", "select": "agent_id,display_name,timezone", "limit": "1"},
+            timeout=5,
+        )
+        if not r.ok or not r.json():
+            logging.warning(f"auto_provision: firm {firm_id} not found")
+            return
+        firm = r.json()[0]
+        if firm.get("agent_id") and firm["agent_id"] != "hazel":
+            logging.info(f"auto_provision: firm {firm_id} already has agent {firm['agent_id']}, skipping")
+            return
+
+        # Get owner info from firm_users
+        fu_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "role": "eq.owner", "select": "user_id", "limit": "1"},
+            timeout=5,
+        )
+        owner_email = ""
+        owner_name = firm.get("display_name", "Builder")
+        if fu_r.ok and fu_r.json():
+            user_id = fu_r.json()[0]["user_id"]
+            # Look up email from auth.users via Supabase admin
+            auth_r = requests.get(
+                f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+                timeout=5,
+            )
+            if auth_r.ok:
+                owner_email = auth_r.json().get("email", "")
+                # Use user metadata name if available
+                user_meta = auth_r.json().get("user_metadata", {})
+                if user_meta.get("full_name"):
+                    owner_name = user_meta["full_name"]
+
+        firm_name = firm.get("display_name", "")
+        tz = firm.get("timezone", "America/New_York")
+
+        if not firm_name:
+            logging.warning(f"auto_provision: firm {firm_id} has no display_name, skipping")
+            return
+
+        # Call provisioning script
+        provision_script = "/home/openclaw/hazel-chat-webhook/provision/provision_firm.py"
+        cmd = [
+            "python3", provision_script,
+            "--firm-name", firm_name,
+            "--owner-email", owner_email or "unknown@example.com",
+            "--owner-name", owner_name,
+            "--timezone", tz,
+        ]
+        logging.info(f"auto_provision: provisioning agent for firm {firm_id} ({firm_name})")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            logging.info(f"auto_provision: success for firm {firm_id}\n{result.stdout[-200:]}")
+            # Update firm with agent_id
+            slug = re.sub(r'[^a-z0-9]+', '-', firm_name.lower().strip()).strip('-')
+            agent_id = f"hazel-{slug}"
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/firms",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"id": f"eq.{firm_id}"},
+                json={"agent_id": agent_id},
+                timeout=5,
+            )
+        else:
+            logging.error(f"auto_provision: failed for firm {firm_id}: {result.stderr[-300:]}")
+    except Exception as e:
+        logging.error(f"auto_provision: error for firm {firm_id}: {e}")
 
 
 @app.route("/api/billing/status", methods=["GET"])
