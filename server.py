@@ -748,15 +748,18 @@ def _execute_approved_email(item, user_id, firm_id):
     Called in a background thread after a queue item of type 'email' is approved.
     Extracts to/subject/body from the structured draft and sends via the approver's Gmail.
     """
+    import re as _re
     from datetime import datetime, timezone
     try:
         draft = item.get("current_draft", "")
         draft_type = item.get("draft_type", "plaintext")
         project_id = item.get("project_id")
         item_id = item.get("id")
+        meta = item.get("meta", "")
+        title = item.get("title", "")
 
-        # Parse structured draft
-        if draft_type == "structured" and isinstance(draft, str):
+        # Parse draft — handle both structured JSON and dict objects
+        if isinstance(draft, str):
             try:
                 draft = json.loads(draft)
             except (json.JSONDecodeError, TypeError):
@@ -768,13 +771,29 @@ def _execute_approved_email(item, user_id, firm_id):
             body = draft.get("body", "")
             cc = draft.get("cc", "")
             in_reply_to = draft.get("in_reply_to", "")
+        elif isinstance(draft, str) and draft.strip():
+            # Plain text body — try to extract send params from meta/title
+            to = ""
+            subject = ""
+            body = draft.strip()
+            cc = ""
+            in_reply_to = ""
         else:
-            # Plaintext draft — can't auto-send without structured fields
-            logging.info(f"_execute_approved_email: item {item_id} is plaintext, skipping auto-send")
+            logging.info(f"_execute_approved_email: item {item_id} has no usable draft content")
             return
 
+        # Fall back: extract "to" from meta field (e.g. "To: jake@example.com · Project Name")
+        if not to and meta:
+            to_match = _re.search(r'To:\s*([^·\n]+)', meta)
+            if to_match:
+                to = to_match.group(1).strip()
+
+        # Fall back: use title as subject
+        if not subject and title:
+            subject = title
+
         if not to or not body:
-            logging.warning(f"_execute_approved_email: item {item_id} missing to or body")
+            logging.warning(f"_execute_approved_email: item {item_id} missing to or body (to={to!r})")
             return
 
         # Try Gmail send
@@ -833,7 +852,7 @@ def api_queue_decide(item_id):
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/queue_items",
             headers={**SB_HEADERS},
-            params={"id": f"eq.{item_id}", "select": "id,status,project_id,firm_id,type,current_draft,draft_type", "limit": "1"},
+            params={"id": f"eq.{item_id}", "select": "id,status,project_id,firm_id,type,current_draft,draft_type,meta,title", "limit": "1"},
             timeout=5,
         )
         r.raise_for_status()
