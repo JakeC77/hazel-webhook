@@ -2145,6 +2145,121 @@ def api_milestones(project_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PUNCH LIST
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/punch-list", methods=["GET"])
+@require_auth
+def api_punch_list_get():
+    """List punch list items for a project."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    project_id = request.args.get("project_id")
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/punch_list_items",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={
+            "project_id": f"eq.{project_id}",
+            "firm_id": f"eq.{firm_id}",
+            "order": "created_at.asc",
+        },
+        timeout=5,
+    )
+    return jsonify(r.json() if r.ok else []), 200
+
+
+@app.route("/api/punch-list", methods=["POST"])
+@require_auth
+def api_punch_list_post():
+    """Create one or more punch list items."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+
+    # Support single item or array of items
+    items = body.get("items", [body]) if "items" in body else [body]
+    project_id = body.get("project_id") or (items[0].get("project_id") if items else None)
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+
+    allowed = {"description", "assigned_trade", "location", "source", "source_file_id"}
+    rows = []
+    for item in items:
+        if not item.get("description"):
+            continue
+        row = {k: v for k, v in item.items() if k in allowed}
+        row["project_id"] = project_id
+        row["firm_id"] = firm_id
+        rows.append(row)
+
+    if not rows:
+        return jsonify({"error": "At least one item with description required"}), 400
+
+    created = []
+    for row in rows:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/punch_list_items",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json=row,
+            timeout=5,
+        )
+        if r.ok and r.json():
+            created.append(r.json()[0])
+
+    return jsonify(created), 201
+
+
+@app.route("/api/punch-list/<item_id>", methods=["PATCH"])
+@require_auth
+def api_punch_list_update(item_id):
+    """Update a punch list item (resolve, edit trade/location)."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    allowed = {"description", "assigned_trade", "location", "resolved", "resolved_at", "resolved_by"}
+    patch = {k: v for k, v in body.items() if k in allowed}
+
+    # Auto-set resolved_at and resolved_by when resolving
+    if patch.get("resolved") is True:
+        from datetime import datetime, timezone
+        patch.setdefault("resolved_at", datetime.now(timezone.utc).isoformat())
+        patch.setdefault("resolved_by", "builder")
+
+    patch["updated_at"] = "now()"
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/punch_list_items",
+        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+        params={"id": f"eq.{item_id}", "firm_id": f"eq.{firm_id}"},
+        json=patch,
+        timeout=5,
+    )
+    if r.ok and r.json():
+        return jsonify(r.json()[0]), 200
+    return jsonify({"error": "Update failed"}), 500
+
+
+@app.route("/api/punch-list/<item_id>", methods=["DELETE"])
+@require_auth
+def api_punch_list_delete(item_id):
+    """Delete a punch list item."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    r = requests.delete(
+        f"{SUPABASE_URL}/rest/v1/punch_list_items",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"id": f"eq.{item_id}", "firm_id": f"eq.{firm_id}"},
+        timeout=5,
+    )
+    return jsonify({"deleted": True}), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GMAIL REAL-TIME INBOX INTEGRATION
 # ══════════════════════════════════════════════════════════════════════════════
 
