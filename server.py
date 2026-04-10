@@ -2412,7 +2412,7 @@ def _send_gmail(user_id, firm_id, to, subject, body, cc=None, in_reply_to=None):
         timeout=15,
     )
     if not send_r.ok:
-        raise ValueError(f"Gmail send failed: {send_r.status_code} {send_r.text[:200]}")
+        raise ValueError(f"Gmail send failed: {send_r.status_code} {send_r.text[:500]}")
 
     result = send_r.json()
     logging.info(f"Gmail sent from {sender_email} to {to}: subject={subject[:60]}")
