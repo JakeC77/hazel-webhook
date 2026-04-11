@@ -424,9 +424,9 @@ def webhook_chat():
     if already_seen(msg_id):
         logging.info(f"Duplicate webhook {msg_id} — skipping")
         return jsonify({"status": "duplicate"}), 200
-    logging.info(f"Chat ({project_id[:8]}): {content[:80]}{' [+files]' if attachments else ''}")
-    t = threading.Thread(target=forward_to_hazel, args=(project_id, content, msg_id, attachments), daemon=True)
-    t.start()
+    # Chat forwarding is now handled by the hazel-dashboard plugin via /hazel/chat.
+    # This webhook endpoint is kept for backward compatibility but no longer forwards.
+    logging.info(f"Chat ({project_id[:8]}): {content[:80]} [handled by plugin]")
     return jsonify({"status": "queued"}), 200
 
 AGENTMAIL_KEY = os.getenv("AGENTMAIL_KEY", "")
@@ -964,11 +964,22 @@ def api_queue_decide(item_id):
 
         # ── Post-approve: auto-send email via Gmail if applicable ─────────
         if action == "approve" and item.get("type") == "email":
-            threading.Thread(
-                target=_execute_approved_email,
-                args=(item, g.user_id, firm_id),
-                daemon=True,
-            ).start()
+            # Check if user has Gmail connected before spawning send thread
+            gmail_check = requests.get(
+                f"{SUPABASE_URL}/rest/v1/gmail_tokens",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{g.user_id}", "select": "id", "limit": "1"},
+                timeout=5,
+            )
+            if gmail_check.ok and gmail_check.json():
+                threading.Thread(
+                    target=_execute_approved_email,
+                    args=(item, g.user_id, firm_id),
+                    daemon=True,
+                ).start()
+            else:
+                result["gmail_warning"] = "Gmail is not connected for your account. Connect Gmail in Settings to send emails as yourself."
+                logging.info(f"Email approved but Gmail not connected for user {g.user_id}")
 
         return jsonify(result), 200
 
@@ -3410,14 +3421,8 @@ def api_messages_post():
     except Exception as e:
         logging.error(f"api_messages_post insert: {e}")
         return jsonify({"error": "Failed to insert message"}), 500
-    msg_id = msg.get("id", "")
-    if not already_seen(msg_id):
-        t = __import__("threading").Thread(
-            target=forward_to_hazel,
-            args=(project_id, content, msg_id, attachments),
-            daemon=True,
-        )
-        t.start()
+    # Chat forwarding is now handled by the hazel-dashboard plugin.
+    # The Supabase webhook on messages INSERT triggers the plugin directly.
     return jsonify(msg), 201
 
 
