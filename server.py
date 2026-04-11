@@ -273,7 +273,7 @@ def post_to_hazel(session_key, message, project_id=None, firm_id=None):
                 json={
                     "tool": "sessions_send",
                     "args": {
-                        "sessionKey": session_key,
+                        "sessionKey": f"agent:hazel:{session_key}",
                         "message": message,
                         "timeoutSeconds": 90,
                     },
