@@ -50,6 +50,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 WEBHOOK_SECRET      = os.getenv("HAZEL_WEBHOOK_SECRET", "hazel-chat-2026")
 OPENCLAW_URL        = os.getenv("OPENCLAW_API_URL", "http://127.0.0.1:18789")
 HOOKS_TOKEN         = os.getenv("OPENCLAW_HOOKS_TOKEN", "")
+GATEWAY_TOKEN       = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+
+# Auto-load gateway token from file if not in env
+if not GATEWAY_TOKEN:
+    _gw_token_path = os.path.expanduser("~/.openclaw/gateway-token.txt")
+    if not os.path.exists(_gw_token_path):
+        _gw_token_path = "/home/openclaw/.openclaw/gateway-token.txt"
+    try:
+        with open(_gw_token_path) as _f:
+            GATEWAY_TOKEN = _f.read().strip()
+    except Exception:
+        pass
 SUPABASE_URL        = "https://zrolyrtaaaiauigrvusl.supabase.co"
 SUPABASE_KEY        = os.getenv("SUPABASE_SERVICE_KEY", "")
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
@@ -239,24 +251,97 @@ def build_file_context(project_id, message_attachments):
             lines.append("")
     return "\n".join(lines) if lines else ""
 
-def post_to_hazel(session_key, message):
-    r = requests.post(
-        f"{OPENCLAW_URL}/hooks/agent",
-        headers={
-            "Authorization": f"Bearer {HOOKS_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "message": message,
-            "name": "Dashboard",
-            "agentId": "hazel",
-            "sessionKey": session_key,
-            "deliver": False,
-            "wakeMode": "now",
-        },
-        timeout=10,
-    )
-    r.raise_for_status()
+def post_to_hazel(session_key, message, project_id=None, firm_id=None):
+    """Send a message to Hazel via sessions_send (synchronous, multi-turn).
+
+    Uses the gateway tools/invoke endpoint which appends to the existing session
+    and returns Hazel's reply. The reply is written to the messages table so it
+    appears on the dashboard without Hazel needing to call send_message.py.
+
+    Falls back to the hooks endpoint if sessions_send is unavailable.
+    """
+    reply = None
+
+    if GATEWAY_TOKEN:
+        try:
+            r = requests.post(
+                f"{OPENCLAW_URL}/tools/invoke",
+                headers={
+                    "Authorization": f"Bearer {GATEWAY_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "tool": "sessions_send",
+                    "args": {
+                        "sessionKey": session_key,
+                        "message": message,
+                        "timeoutSeconds": 90,
+                    },
+                },
+                timeout=120,
+            )
+            if r.ok:
+                result = r.json()
+                # Extract reply from nested response
+                details = result.get("result", {}).get("details", {})
+                reply = details.get("reply", "")
+                if not reply:
+                    # Try content array
+                    content = result.get("result", {}).get("content", [])
+                    if content and isinstance(content, list):
+                        try:
+                            parsed = json.loads(content[0].get("text", "{}"))
+                            reply = parsed.get("reply", "")
+                        except (json.JSONDecodeError, IndexError, AttributeError):
+                            pass
+                if reply:
+                    logging.info(f"Hazel replied ({session_key[:30]}): {reply[:80]}")
+            else:
+                logging.warning(f"sessions_send failed: {r.status_code}, falling back to hooks")
+        except requests.exceptions.Timeout:
+            logging.warning(f"sessions_send timed out for {session_key}, falling back to hooks")
+        except Exception as e:
+            logging.warning(f"sessions_send error: {e}, falling back to hooks")
+
+    # Fall back to fire-and-forget hooks if sessions_send didn't work
+    if not reply:
+        r = requests.post(
+            f"{OPENCLAW_URL}/hooks/agent",
+            headers={
+                "Authorization": f"Bearer {HOOKS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "message": message,
+                "name": "Dashboard",
+                "agentId": "hazel",
+                "sessionKey": session_key,
+                "deliver": False,
+                "wakeMode": "now",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return  # No reply to write
+
+    # Write Hazel's reply to messages table so it appears on the dashboard
+    if reply and project_id:
+        msg_row = {
+            "project_id": project_id,
+            "role": "hazel",
+            "content": reply,
+        }
+        if firm_id:
+            msg_row["firm_id"] = firm_id
+        try:
+            requests.post(
+                f"{SUPABASE_URL}/rest/v1/messages",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                json=msg_row,
+                timeout=5,
+            )
+        except Exception as e:
+            logging.warning(f"Failed to write Hazel reply to messages: {e}")
 
 def forward_home(content, msg_id):
     try:
@@ -268,10 +353,8 @@ def forward_home(content, msg_id):
             "getting started, or anything not tied to a specific job.\n"
             "To reply, use: python3 skills/boh-dashboard/scripts/send_message.py --home --message \"...\"\n\n"
             + content
-            + "\n\n---\nREPLY REQUIREMENT: You MUST post your response using send_message.py --home. "
-            "If you do not call send_message.py, the builder will not see your reply."
         )
-        post_to_hazel(session_key, message)
+        post_to_hazel(session_key, message, project_id=HOME_PROJECT_ID)
         logging.info(f"Forwarded to hazel home: {content[:80]}")
     except Exception:
         logging.exception(f"Failed to forward home message {msg_id} to hazel")
@@ -310,41 +393,6 @@ def forward_setup(project_id, msg_id):
     except Exception:
         logging.exception(f"Failed to trigger project setup for {msg_id}")
 
-REPLY_INSTRUCTION = (
-    "\n\n---\n"
-    "REPLY REQUIREMENT: You MUST post your response back to the dashboard using send_message.py. "
-    "If you do not call send_message.py, the builder will not see your reply.\n"
-    "Reply via: python3 skills/boh-dashboard/scripts/send_message.py "
-    "--project-id {project_id} --message \"your reply here\""
-)
-
-
-def _watch_for_response(project_id, firm_id, after_ts):
-    """Safety net: if Hazel doesn't post a response within 90s, log a warning."""
-    import time
-    from datetime import datetime, timezone
-    for _ in range(18):  # 18 * 5s = 90s
-        time.sleep(5)
-        try:
-            r = requests.get(
-                f"{SUPABASE_URL}/rest/v1/messages",
-                headers={**SB_HEADERS, "Content-Type": "application/json"},
-                params={
-                    "project_id": f"eq.{project_id}",
-                    "role": "eq.hazel",
-                    "created_at": f"gt.{after_ts}",
-                    "select": "id",
-                    "limit": "1",
-                },
-                timeout=5,
-            )
-            if r.ok and r.json():
-                return  # Response found, all good
-        except Exception:
-            pass
-    logging.warning(f"Response watchdog: Hazel did not reply to project {project_id} within 90s")
-
-
 def forward_to_hazel(project_id, content, msg_id, message_attachments):
     if project_id == HOME_PROJECT_ID:
         forward_home(content, msg_id)
@@ -368,14 +416,8 @@ def forward_to_hazel(project_id, content, msg_id, message_attachments):
         if file_context:
             message += file_context + "\n"
         message += content
-        message += REPLY_INSTRUCTION.format(project_id=project_id)
-        post_to_hazel(session_key, message)
+        post_to_hazel(session_key, message, project_id=project_id, firm_id=info.get("firm_id"))
         logging.info(f"Forwarded to hazel ({project_id[:8]}): {content[:80]}")
-
-        # Start response watchdog
-        from datetime import datetime, timezone
-        after_ts = datetime.now(timezone.utc).isoformat()
-        threading.Thread(target=_watch_for_response, args=(project_id, info.get("firm_id"), after_ts), daemon=True).start()
     except Exception:
         logging.exception(f"Failed to forward message {msg_id} to hazel")
 
