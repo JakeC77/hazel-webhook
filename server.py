@@ -268,6 +268,8 @@ def forward_home(content, msg_id):
             "getting started, or anything not tied to a specific job.\n"
             "To reply, use: python3 skills/boh-dashboard/scripts/send_message.py --home --message \"...\"\n\n"
             + content
+            + "\n\n---\nREPLY REQUIREMENT: You MUST post your response using send_message.py --home. "
+            "If you do not call send_message.py, the builder will not see your reply."
         )
         post_to_hazel(session_key, message)
         logging.info(f"Forwarded to hazel home: {content[:80]}")
@@ -308,6 +310,41 @@ def forward_setup(project_id, msg_id):
     except Exception:
         logging.exception(f"Failed to trigger project setup for {msg_id}")
 
+REPLY_INSTRUCTION = (
+    "\n\n---\n"
+    "REPLY REQUIREMENT: You MUST post your response back to the dashboard using send_message.py. "
+    "If you do not call send_message.py, the builder will not see your reply.\n"
+    "Reply via: python3 skills/boh-dashboard/scripts/send_message.py "
+    "--project-id {project_id} --message \"your reply here\""
+)
+
+
+def _watch_for_response(project_id, firm_id, after_ts):
+    """Safety net: if Hazel doesn't post a response within 90s, log a warning."""
+    import time
+    from datetime import datetime, timezone
+    for _ in range(18):  # 18 * 5s = 90s
+        time.sleep(5)
+        try:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/messages",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={
+                    "project_id": f"eq.{project_id}",
+                    "role": "eq.hazel",
+                    "created_at": f"gt.{after_ts}",
+                    "select": "id",
+                    "limit": "1",
+                },
+                timeout=5,
+            )
+            if r.ok and r.json():
+                return  # Response found, all good
+        except Exception:
+            pass
+    logging.warning(f"Response watchdog: Hazel did not reply to project {project_id} within 90s")
+
+
 def forward_to_hazel(project_id, content, msg_id, message_attachments):
     if project_id == HOME_PROJECT_ID:
         forward_home(content, msg_id)
@@ -331,8 +368,14 @@ def forward_to_hazel(project_id, content, msg_id, message_attachments):
         if file_context:
             message += file_context + "\n"
         message += content
+        message += REPLY_INSTRUCTION.format(project_id=project_id)
         post_to_hazel(session_key, message)
         logging.info(f"Forwarded to hazel ({project_id[:8]}): {content[:80]}")
+
+        # Start response watchdog
+        from datetime import datetime, timezone
+        after_ts = datetime.now(timezone.utc).isoformat()
+        threading.Thread(target=_watch_for_response, args=(project_id, info.get("firm_id"), after_ts), daemon=True).start()
     except Exception:
         logging.exception(f"Failed to forward message {msg_id} to hazel")
 
