@@ -1047,7 +1047,7 @@ def api_firm_setup():
         r_firm = requests.post(
             f"{SUPABASE_URL}/rest/v1/firms",
             headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
-            json={"display_name": firm_name},
+            json={"display_name": firm_name, "onboarding_step": 1, "onboarding_complete": False},
             timeout=5,
         )
         r_firm.raise_for_status()
@@ -1093,6 +1093,106 @@ def api_firm_context():
     except Exception as e:
         logging.error(f"api_firm_context: {e}")
         return jsonify({"error": "Internal server error"}), 500
+
+
+def _send_phone_provisioning_email(firm_id: str, firm_name: str):
+    """Fire-and-forget email to jake@ requesting Hazel phone provisioning."""
+    try:
+        if not AGENTMAIL_KEY:
+            logging.warning("_send_phone_provisioning_email: AGENTMAIL_KEY not set, skipping")
+            return
+        mail_r = requests.post(
+            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
+            json={
+                "to": ["jake@haventechsolutions.com"],
+                "subject": f"[Hazel] Phone provisioning request — {firm_name}",
+                "text": (
+                    f"A new firm has completed onboarding and needs a Hazel phone number.\n\n"
+                    f"Firm: {firm_name}\n"
+                    f"Firm ID: {firm_id}\n\n"
+                    f"Steps:\n"
+                    f"1. Provision a number via ClawdTalk\n"
+                    f"2. Update the firms table:\n"
+                    f"   UPDATE firms SET hazel_phone = '+1XXXXXXXXXX', "
+                    f"hazel_phone_status = 'active' WHERE id = '{firm_id}';\n"
+                ),
+            },
+            timeout=10,
+        )
+        if not mail_r.ok:
+            logging.warning(f"_send_phone_provisioning_email AgentMail error: {mail_r.status_code}")
+    except Exception as e:
+        logging.warning(f"_send_phone_provisioning_email (non-fatal): {e}")
+
+
+@app.route("/api/firm", methods=["PATCH"])
+@require_auth
+def api_firm_patch():
+    """Incremental firm profile update. Used by onboarding wizard and settings."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    body = request.get_json(force=True) or {}
+    allowed = {
+        "display_name", "phone", "city", "state",
+        "sign_off_name", "sign_off_title", "timezone",
+        "onboarding_step",
+    }
+    patch = {k: v for k, v in body.items() if k in allowed}
+    if not patch:
+        return jsonify({"error": "No valid fields to update"}), 400
+    patch["updated_at"] = "now()"
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            params={"id": f"eq.{firm_id}"},
+            json=patch,
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return jsonify({"error": "Firm not found"}), 404
+        return jsonify(data[0]), 200
+    except Exception as e:
+        logging.error(f"api_firm_patch: {e}")
+        return jsonify({"error": "Failed to update firm"}), 500
+
+
+@app.route("/api/onboarding/complete", methods=["POST"])
+@require_auth
+def api_onboarding_complete():
+    """Mark onboarding complete, set hazel_phone_status=pending, send provisioning email."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+    try:
+        patch = {
+            "onboarding_complete": True,
+            "onboarding_step": 7,
+            "hazel_phone_status": "pending",
+            "updated_at": "now()",
+        }
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            params={"id": f"eq.{firm_id}"},
+            json=patch,
+            timeout=5,
+        )
+        r.raise_for_status()
+        firm_data = r.json()
+        firm = firm_data[0] if firm_data else {}
+
+        _send_phone_provisioning_email(firm_id, firm.get("display_name", "Unknown"))
+
+        logging.info(f"api_onboarding_complete: firm {firm_id[:8]} onboarding done")
+        return jsonify({"status": "complete", "firm": firm}), 200
+    except Exception as e:
+        logging.error(f"api_onboarding_complete: {e}")
+        return jsonify({"error": "Failed to complete onboarding"}), 500
 
 
 @app.route("/api/team", methods=["GET"])
