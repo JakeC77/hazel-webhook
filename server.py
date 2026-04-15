@@ -776,12 +776,15 @@ def api_projects_post():
         return jsonify({"error": "name is required"}), 400
     import uuid as _uuid
     project = {
-        "id":             body.get("id") or str(_uuid.uuid4()),
-        "name":           name,
-        "firm_id":        firm_id,
-        "status":         body.get("status", "on-track"),
-        "client_name":    body.get("client_name") or None,
-        "contract_value": body.get("contract_value") or None,
+        "id":                body.get("id") or str(_uuid.uuid4()),
+        "name":              name,
+        "firm_id":           firm_id,
+        "status":             body.get("status", "on-track"),
+        "client_name":       body.get("client_name") or None,
+        "contract_value":    body.get("contract_value") or None,
+        "address":           body.get("address") or None,
+        "client_contact":    body.get("client_contact") or None,
+        "target_completion": body.get("target_completion") or None,
     }
     try:
         r = requests.post(
