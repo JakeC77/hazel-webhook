@@ -3697,5 +3697,172 @@ def api_files_delete(file_id):
         return jsonify({"error": "Failed to delete file"}), 500
 
 
+# ── Supabase Auth "Send Email" Hook ────────────────────────────────────────
+# Sends auth emails (signup, recovery, magic link, email change, invite) via
+# AgentMail's REST API, bypassing Supabase's SMTP path entirely.
+#
+# Configure in Supabase: Authentication → Hooks → "Send email hook" → HTTPS
+#   URL:    https://hazel.haventechsolutions.com/webhook/supabase-send-email
+#   Secret: copy from the hook's "Generate secret" button (format v1,whsec_...)
+#           and set env var SUPABASE_SEND_EMAIL_HOOK_SECRET to that value.
+#
+# Supabase signs requests using the Standard Webhooks spec (Svix headers).
+import base64, hmac, hashlib, time
+from urllib.parse import urlencode
+
+SUPABASE_SEND_EMAIL_HOOK_SECRET = os.getenv("SUPABASE_SEND_EMAIL_HOOK_SECRET", "")
+SEND_EMAIL_HOOK_FROM = os.getenv("SEND_EMAIL_HOOK_FROM_INBOX", HAZEL_INBOX)
+
+
+def _decode_hook_secret(raw: str) -> bytes:
+    """Strip the 'v1,whsec_' prefix and base64-decode the secret."""
+    s = raw.strip()
+    if s.startswith("v1,"):
+        s = s[3:]
+    if s.startswith("whsec_"):
+        s = s[6:]
+    # Standard Webhooks stores the secret as base64.
+    return base64.b64decode(s)
+
+
+def _verify_standard_webhook(raw_body: bytes, headers, secret: str) -> bool:
+    """Verify a Standard Webhooks signature (Svix headers)."""
+    if not secret:
+        return False
+    wh_id = headers.get("webhook-id") or headers.get("Webhook-ID") or ""
+    wh_ts = headers.get("webhook-timestamp") or headers.get("Webhook-Timestamp") or ""
+    wh_sig = headers.get("webhook-signature") or headers.get("Webhook-Signature") or ""
+    if not (wh_id and wh_ts and wh_sig):
+        return False
+
+    # Reject requests outside a 5-minute window
+    try:
+        ts = int(wh_ts)
+        if abs(int(time.time()) - ts) > 300:
+            return False
+    except ValueError:
+        return False
+
+    key = _decode_hook_secret(secret)
+    signed = f"{wh_id}.{wh_ts}.".encode("utf-8") + raw_body
+    expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+
+    # Header can contain multiple space-separated "v1,<sig>" pairs.
+    for pair in wh_sig.split():
+        version, _, sig = pair.partition(",")
+        if version == "v1" and hmac.compare_digest(sig, expected):
+            return True
+    return False
+
+
+# Subject line + intro line per action type. Keep these short + generic.
+_ACTION_COPY = {
+    "signup":            ("Confirm your email", "Confirm your email to finish signing up for Hazel."),
+    "invite":            ("You've been invited to Hazel", "You've been invited to join Hazel."),
+    "magiclink":         ("Your sign-in link", "Click below to sign in to Hazel."),
+    "recovery":          ("Reset your password", "Click below to reset your Hazel password."),
+    "email_change":      ("Confirm your email change", "Confirm this is your new email address for Hazel."),
+    "email_change_new":  ("Confirm your new email", "Confirm this is your new email address for Hazel."),
+    "reauthentication":  ("Your verification code", "Use the code below to verify your identity."),
+}
+
+
+def _build_confirm_url(email_data: dict) -> str:
+    """Build the Supabase verify URL from the hook payload."""
+    token_hash = email_data.get("token_hash") or ""
+    action = email_data.get("email_action_type") or ""
+    redirect_to = email_data.get("redirect_to") or email_data.get("site_url") or ""
+    qs = urlencode({"token": token_hash, "type": action, "redirect_to": redirect_to})
+    return f"{SUPABASE_URL}/auth/v1/verify?{qs}"
+
+
+def _render_email(user: dict, email_data: dict):
+    action = email_data.get("email_action_type", "")
+    subject, intro = _ACTION_COPY.get(
+        action, ("Action required for your Hazel account", "You have a pending Hazel account action.")
+    )
+    token = email_data.get("token", "")
+    confirm_url = _build_confirm_url(email_data) if email_data.get("token_hash") else ""
+
+    # Reauthentication flow only uses the 6-digit code, not a link.
+    if action == "reauthentication":
+        text = f"{intro}\n\nYour code: {token}\n\nIf you did not request this, ignore this email."
+        html = (
+            f'<p>{intro}</p>'
+            f'<p style="font-size:22px;letter-spacing:3px;font-weight:bold;">{token}</p>'
+            f'<p style="color:#666;font-size:13px;">If you did not request this, ignore this email.</p>'
+        )
+    else:
+        text = (
+            f"{intro}\n\n"
+            f"{confirm_url}\n\n"
+            f"Or use code: {token}\n\n"
+            f"If you did not request this, ignore this email."
+        )
+        html = (
+            f'<p>{intro}</p>'
+            f'<p><a href="{confirm_url}" '
+            f'style="background:#1e3a5f;color:white;padding:10px 20px;text-decoration:none;'
+            f'border-radius:6px;display:inline-block;margin:8px 0;">Confirm</a></p>'
+            f'<p style="color:#666;font-size:13px;">Or use code <strong>{token}</strong>.</p>'
+            f'<p style="color:#666;font-size:13px;">If you did not request this, ignore this email.</p>'
+        )
+    return subject, text, html
+
+
+@app.route("/webhook/supabase-send-email", methods=["POST"])
+def webhook_supabase_send_email():
+    """Supabase Auth 'Send email' hook → AgentMail REST API."""
+    raw = request.get_data()  # raw bytes, needed for signature
+
+    if not SUPABASE_SEND_EMAIL_HOOK_SECRET:
+        logging.error("supabase_send_email: SUPABASE_SEND_EMAIL_HOOK_SECRET not set")
+        return jsonify({"error": {"http_code": 500, "message": "hook not configured"}}), 500
+
+    if not _verify_standard_webhook(raw, request.headers, SUPABASE_SEND_EMAIL_HOOK_SECRET):
+        logging.warning("supabase_send_email: signature verification failed")
+        return jsonify({"error": {"http_code": 401, "message": "invalid signature"}}), 401
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return jsonify({"error": {"http_code": 400, "message": "invalid JSON"}}), 400
+
+    user = payload.get("user") or {}
+    email_data = payload.get("email_data") or {}
+    recipient = (user.get("email") or "").strip()
+    if not recipient:
+        return jsonify({"error": {"http_code": 400, "message": "missing user.email"}}), 400
+
+    if not AGENTMAIL_KEY:
+        logging.error("supabase_send_email: AGENTMAIL_KEY not set")
+        return jsonify({"error": {"http_code": 500, "message": "mail provider not configured"}}), 500
+
+    subject, text_body, html_body = _render_email(user, email_data)
+
+    try:
+        mail_r = requests.post(
+            f"https://api.agentmail.to/v0/inboxes/{SEND_EMAIL_HOOK_FROM}/messages/send",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
+            json={"to": [recipient], "subject": subject, "text": text_body, "html": html_body},
+            timeout=10,
+        )
+    except Exception as e:
+        logging.error(f"supabase_send_email AgentMail request failed: {e}")
+        return jsonify({"error": {"http_code": 502, "message": "mail provider unreachable"}}), 502
+
+    if not mail_r.ok:
+        logging.warning(
+            f"supabase_send_email AgentMail {mail_r.status_code}: {mail_r.text[:300]}"
+        )
+        return jsonify({
+            "error": {"http_code": 502, "message": f"mail provider returned {mail_r.status_code}"}
+        }), 502
+
+    action = email_data.get("email_action_type", "?")
+    logging.info(f"supabase_send_email: sent {action} email to {recipient}")
+    return jsonify({}), 200
+
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8700, threaded=True)
