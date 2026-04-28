@@ -955,7 +955,7 @@ def api_invites():
         return jsonify({"error": "Failed to create invite"}), 500
 
     # Send invite email via AgentMail (bypasses Supabase's 3/hr rate limit)
-    invite_url = f"https://hazel.haventechsolutions.com/?invite_token={token}"
+    invite_url = f"https://hazel.haventechsolutions.com/?invite_token={token}&invite_email={email}"
     try:
         if not AGENTMAIL_KEY:
             raise ValueError("AGENTMAIL_KEY not set")
