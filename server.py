@@ -473,7 +473,7 @@ def _execute_approved_email(item, user_id, firm_id):
     Extracts to/subject/body from the structured draft and sends via the approver's Gmail.
     """
     import re as _re
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
     try:
         draft = item.get("current_draft", "")
         draft_type = item.get("draft_type", "plaintext")
@@ -946,7 +946,7 @@ def api_invites():
         inv_r = requests.post(
             f"{SUPABASE_URL}/rest/v1/invite_tokens",
             headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
-            json={"firm_id": firm_id, "email": email, "token": token, "invited_by": user_id},
+            json={"firm_id": firm_id, "email": email, "token": token, "invited_by": user_id, "expires_at": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat()},
             timeout=5,
         )
         inv_r.raise_for_status()
