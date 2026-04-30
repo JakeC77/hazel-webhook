@@ -341,7 +341,7 @@ def api_contacts_post():
     name = (body.get("name") or "").strip()
     if not name:
         return jsonify({"error": "name is required"}), 400
-    allowed = {"name","type","company","trade","phone","email","notes"}
+    allowed = {"name","type","company","trade","phone","email","notes","sms_consent","sms_consent_at"}
     contact = {k: v for k, v in body.items() if k in allowed}
     contact["firm_id"] = firm_id
     try:
@@ -364,7 +364,7 @@ def api_contacts_put(contact_id):
     if not firm_id:
         return jsonify({"error": "No firm found"}), 404
     body = request.get_json(force=True) or {}
-    allowed = {"name","type","company","trade","phone","email","notes"}
+    allowed = {"name","type","company","trade","phone","email","notes","sms_consent","sms_consent_at"}
     patch = {k: v for k, v in body.items() if k in allowed}
     patch["updated_at"] = "now()"
     try:
