@@ -443,7 +443,8 @@ def api_projects_post():
         "client_name":       body.get("client_name") or None,
         "contract_value":    body.get("contract_value") or None,
         "address":           body.get("address") or None,
-        "client_contact":    body.get("client_contact") or None,
+        "client_phone":      body.get("client_phone") or body.get("client_contact") or None,
+        "client_email":      body.get("client_email") or None,
         "target_completion": body.get("target_completion") or None,
     }
     try:
