@@ -2390,7 +2390,7 @@ def auth_gmail_start():
         + urllib.parse.urlencode({
             "client_id": GMAIL_CLIENT_ID,
             "response_type": "code",
-            "scope": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+            "scope": "https://www.googleapis.com/auth/gmail.send",
             "access_type": "offline",
             "prompt": "consent",
             "redirect_uri": GMAIL_REDIRECT_URI,
