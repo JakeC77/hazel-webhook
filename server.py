@@ -446,6 +446,182 @@ def api_projects_get():
         return jsonify({"error": "Failed to fetch projects"}), 500
 
 
+@app.route("/api/projects/portfolio", methods=["GET"])
+@require_auth
+def api_projects_portfolio():
+    """Return all card data the portfolio view needs in a single round trip.
+    Trello card t8gNelRc.
+
+    For each non-archived project the caller's firm owns, returns:
+      id, name, client_name, status, schedule_variance_days, contract_value,
+      spent_to_date, risks[], queue_items[] (max 3), punch_list { open, total }
+
+    Sort order: delayed > at-risk > on-track. Returns [] (not 404) when the
+    firm has no active projects.
+
+    schedule_variance_days is a placeholder (returns 0) until we have a real
+    scheduling signal source — either a graph rebuild or a Supabase column
+    populated from QBO/external data. Documented in the Cgbxvr4m / YsevHmJQ
+    discussion as out-of-scope here.
+    """
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    sb = lambda path, params: requests.get(
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params=params, timeout=5,
+    )
+
+    try:
+        # 1. Active projects for this firm
+        pr = sb("projects", {
+            "firm_id": f"eq.{firm_id}",
+            "status": "neq.archived",
+            "select": "id,name,client_name,status,contract_value",
+            "order": "created_at.asc",
+        })
+        pr.raise_for_status()
+        projects = pr.json()
+        if not projects:
+            return jsonify([]), 200
+
+        project_ids = [p["id"] for p in projects]
+        in_clause = "in.(" + ",".join(project_ids) + ")"
+
+        # 2-5: parallelizable in principle; sequential is fine at portfolio
+        # cardinalities (4-10 projects). Each query is firm-scoped via the
+        # project_id filter through projects we already vetted.
+        risks_r = sb("project_risks", {
+            "firm_id": f"eq.{firm_id}",
+            "resolved": "eq.false",
+            "select": "project_id,category,severity,description",
+        })
+        queue_r = sb("queue_items", {
+            "firm_id": f"eq.{firm_id}",
+            "status": "eq.active",
+            "project_id": in_clause,
+            "select": "id,title,type,project_id,created_at",
+            "order": "created_at.asc",
+        })
+        punch_r = sb("punch_list_items", {
+            "firm_id": f"eq.{firm_id}",
+            "project_id": in_clause,
+            "select": "project_id,resolved",
+        })
+        cost_r = sb("qbo_job_cost_cache", {
+            "firm_id": f"eq.{firm_id}",
+            "project_id": in_clause,
+            "select": "project_id,actual_amount",
+        })
+
+        risks  = risks_r.json()  if risks_r.ok  else []
+        queue  = queue_r.json()  if queue_r.ok  else []
+        punch  = punch_r.json()  if punch_r.ok  else []
+        costs  = cost_r.json()   if cost_r.ok   else []
+
+        # Bucket by project_id for O(1) lookup as we compose cards
+        risks_by_pid = {}
+        for r in risks:
+            risks_by_pid.setdefault(r["project_id"], []).append({
+                "category": r.get("category"),
+                "severity": r.get("severity"),
+                "description": r.get("description"),
+            })
+
+        queue_by_pid = {}
+        for q in queue:
+            lst = queue_by_pid.setdefault(q["project_id"], [])
+            if len(lst) < 3:  # cap at 3 per spec
+                lst.append({
+                    "id": q.get("id"),
+                    "title": q.get("title"),
+                    "type": q.get("type"),
+                })
+
+        punch_by_pid = {}
+        for pli in punch:
+            pid = pli["project_id"]
+            slot = punch_by_pid.setdefault(pid, {"open": 0, "total": 0})
+            slot["total"] += 1
+            if not pli.get("resolved"):
+                slot["open"] += 1
+
+        spent_by_pid = {}
+        for c in costs:
+            pid = c["project_id"]
+            try:
+                spent_by_pid[pid] = spent_by_pid.get(pid, 0) + float(c.get("actual_amount") or 0)
+            except (TypeError, ValueError):
+                pass
+
+        # Compose card payloads
+        cards = []
+        for p in projects:
+            pid = p["id"]
+            cards.append({
+                "id": pid,
+                "name": p.get("name") or "Unnamed Project",
+                "client_name": p.get("client_name"),
+                "status": p.get("status") or "on-track",
+                # Placeholder until we have a real schedule-signal source.
+                "schedule_variance_days": 0,
+                "contract_value": p.get("contract_value") or 0,
+                "spent_to_date": spent_by_pid.get(pid, 0),
+                "risks": risks_by_pid.get(pid, []),
+                "queue_items": queue_by_pid.get(pid, []),
+                "punch_list": punch_by_pid.get(pid, {"open": 0, "total": 0}),
+            })
+
+        # Status sort: delayed first, then at-risk, then everything else
+        status_rank = {"delayed": 0, "at-risk": 1, "on-track": 2}
+        cards.sort(key=lambda c: status_rank.get(c["status"], 3))
+
+        return jsonify(cards), 200
+    except Exception as e:
+        logging.error(f"api_projects_portfolio: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/morning-briefing/today", methods=["GET"])
+@require_auth
+def api_morning_briefing_today():
+    """Return today's morning briefing for the caller's firm, or 404 if none.
+    Trello card Fpi3SVTx (route deferred from the migrations PR), consumed by
+    v14QKFcI's portfolio briefing component.
+
+    Date is computed in UTC. The briefing scheduler uses the same convention
+    when writing rows, so a firm's briefing for 'today' is keyed off the UTC
+    date the scheduler ran. (Per-firm timezone is a future story.)
+    """
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    from datetime import datetime as _dt
+    today = _dt.utcnow().strftime("%Y-%m-%d")
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/morning_briefings",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={
+                "firm_id": f"eq.{firm_id}",
+                "briefing_date": f"eq.{today}",
+                "select": "*",
+                "limit": "1",
+            },
+            timeout=5,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return jsonify({"error": "No briefing for today"}), 404
+        return jsonify(rows[0]), 200
+    except Exception as e:
+        logging.error(f"api_morning_briefing_today: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.route("/api/projects", methods=["POST"])
 @require_auth
 def api_projects_post():
