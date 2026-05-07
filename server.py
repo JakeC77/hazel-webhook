@@ -279,10 +279,33 @@ def api_preferences_put():
         "tone", "custom_phrases", "client_follow_up_days",
         "jurisdictions", "primary_jurisdiction",
         "daily_digest_enabled",
+        # Morning briefing prefs (Trello uFWe99xk + OaV9vSGT). Migration 020
+        # added these columns; the dashboard's Settings UI (Trello 28aKzGpN)
+        # PATCHes them on toggle/picker change.
+        "morning_briefing_enabled", "morning_briefing_time",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
     if not patch:
         return jsonify({"error": "No valid fields to update"}), 400
+    # Validate morning_briefing_time when present. Accept HH:MM (24-hour) and
+    # HH:MM:SS — Postgres time accepts both, but we normalize to HH:MM:SS to
+    # keep the column shape consistent. Reject anything else with a 400 so a
+    # malformed save doesn't quietly corrupt the value or 500 on the upstream.
+    mbt = patch.get("morning_briefing_time")
+    if mbt is not None:
+        if not isinstance(mbt, str):
+            return jsonify({"error": "morning_briefing_time must be a string in HH:MM format"}), 400
+        import re as _re
+        if not _re.match(r"^\d{2}:\d{2}(:\d{2})?$", mbt):
+            return jsonify({"error": "morning_briefing_time must be HH:MM (24-hour)"}), 400
+        # Defensive: parse out hour/minute and bounds-check
+        try:
+            hh, mm = int(mbt[0:2]), int(mbt[3:5])
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError("out of range")
+        except ValueError:
+            return jsonify({"error": "morning_briefing_time must be a valid 24-hour clock value"}), 400
+        patch["morning_briefing_time"] = mbt if len(mbt) == 8 else mbt + ":00"
     patch["updated_at"] = "now()"
     try:
         r = requests.patch(
