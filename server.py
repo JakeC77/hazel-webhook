@@ -513,7 +513,7 @@ def api_projects_portfolio():
         cost_r = sb("qbo_job_cost_cache", {
             "firm_id": f"eq.{firm_id}",
             "project_id": in_clause,
-            "select": "project_id,actual_amount",
+            "select": "project_id,actual_amount,budgeted_amount",
         })
 
         risks  = risks_r.json()  if risks_r.ok  else []
@@ -549,10 +549,15 @@ def api_projects_portfolio():
                 slot["open"] += 1
 
         spent_by_pid = {}
+        budgeted_by_pid = {}
         for c in costs:
             pid = c["project_id"]
             try:
                 spent_by_pid[pid] = spent_by_pid.get(pid, 0) + float(c.get("actual_amount") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                budgeted_by_pid[pid] = budgeted_by_pid.get(pid, 0) + float(c.get("budgeted_amount") or 0)
             except (TypeError, ValueError):
                 pass
 
@@ -560,6 +565,13 @@ def api_projects_portfolio():
         cards = []
         for p in projects:
             pid = p["id"]
+            spent    = spent_by_pid.get(pid, 0)
+            budgeted = budgeted_by_pid.get(pid, 0)
+            # budget_variance: positive = OVER budget (bad/red); negative =
+            # under budget (good/green). Computed as actual - budgeted, the
+            # opposite sign convention from qbo_job_cost_cache.variance
+            # (which is budgeted - actual) — matches the design's "+$6,200"
+            # red display where positive means over.
             cards.append({
                 "id": pid,
                 "name": p.get("name") or "Unnamed Project",
@@ -567,8 +579,10 @@ def api_projects_portfolio():
                 "status": p.get("status") or "on-track",
                 # Placeholder until we have a real schedule-signal source.
                 "schedule_variance_days": 0,
-                "contract_value": p.get("contract_value") or 0,
-                "spent_to_date": spent_by_pid.get(pid, 0),
+                "contract_value":  p.get("contract_value") or 0,
+                "spent_to_date":   spent,
+                "budgeted_amount": budgeted,
+                "budget_variance": spent - budgeted,
                 "risks": risks_by_pid.get(pid, []),
                 "queue_items": queue_by_pid.get(pid, []),
                 "punch_list": punch_by_pid.get(pid, {"open": 0, "total": 0}),
