@@ -3187,19 +3187,25 @@ def api_messages_post():
     if not firm_id:
         return jsonify({"error": "No firm found for this user"}), 404
     body        = request.get_json(force=True) or {}
-    project_id  = (body.get("project_id") or "").strip()
+    # project_id is now optional. When omitted (or explicitly null), the
+    # message is portfolio-level (Trello bjmtUk8K) — the hazel-plugin's
+    # ChatHandler branches on null project_id to inject firm-only context
+    # and use the firm-scoped session key. Migration 023 makes the column
+    # nullable; without that this insert will 500 on the upstream.
+    project_id  = (body.get("project_id") or "").strip() or None
     content     = (body.get("content") or "").strip()
     attachments = body.get("attachments") or []
-    if not project_id:
-        return jsonify({"error": "project_id is required"}), 400
     if not content and not attachments:
         return jsonify({"error": "content or attachments required"}), 400
+    insert = {"firm_id": firm_id, "role": "builder",
+              "content": content, "attachments": attachments}
+    if project_id:
+        insert["project_id"] = project_id
     try:
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/messages",
             headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
-            json={"project_id": project_id, "firm_id": firm_id, "role": "builder",
-                  "content": content, "attachments": attachments},
+            json=insert,
             timeout=5,
         )
         r.raise_for_status()
@@ -3217,19 +3223,36 @@ def api_messages_post():
 @app.route("/api/messages", methods=["GET"])
 @require_auth
 def api_messages_get():
-    """Load messages for a project via service role (bypasses RLS)."""
+    """Load messages via service role (bypasses RLS). Two modes:
+
+    - ?project_id=<uuid>     project-scoped chat history (existing behavior)
+    - ?scope=portfolio       firm-scoped portfolio chat (Trello bjmtUk8K) —
+                             returns rows where project_id IS NULL for the
+                             caller's firm.
+
+    Exactly one of the two must be provided. Both modes are firm-scoped via
+    g.firm_id, so cross-firm reads are impossible regardless of which the
+    caller picks.
+    """
     firm_id = g.firm_id
     if not firm_id:
         return jsonify({"error": "No firm found for this user"}), 404
     project_id = request.args.get("project_id", "").strip()
-    if not project_id:
-        return jsonify({"error": "project_id is required"}), 400
+    scope      = request.args.get("scope", "").strip().lower()
+    if not project_id and scope != "portfolio":
+        return jsonify({"error": "project_id or scope=portfolio is required"}), 400
+    params = {"select": "*", "order": "created_at.asc", "limit": "100",
+              "firm_id": f"eq.{firm_id}"}
+    if project_id:
+        params["project_id"] = f"eq.{project_id}"
+    else:
+        # Portfolio scope: only rows with no project anchor.
+        params["project_id"] = "is.null"
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/messages",
             headers={**SB_HEADERS, "Content-Type": "application/json"},
-            params={"project_id": f"eq.{project_id}", "select": "*",
-                    "order": "created_at.asc", "limit": "100"},
+            params=params,
             timeout=5,
         )
         r.raise_for_status()
