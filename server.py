@@ -3761,5 +3761,287 @@ def webhook_supabase_send_email():
     return jsonify({}), 200
 
 
+# ── RISK DETECTION (Trello YsevHmJQ — Option B, Supabase-only) ────────────────
+# Aggregates per-project signals from Supabase tables into project_risks rows
+# the dashboard's portfolio cards consume directly. No graph/Neo4j dependency.
+#
+# Trigger: POST /api/hazel/internal/detect-risks (cron every 30 min on droplet,
+# or manual trigger for testing). Auth via shared X-Internal-Token header.
+#
+# Categories implemented in v1:
+#   pending-decision : oldest active queue_item age (48-72h yellow / >72h red)
+#   unapproved-co    : change-order queue_item age in business days (>5 red)
+#   budget-variance  : worst-pct-over from qbo_job_cost_cache (5-10% yellow / >10% red)
+# Categories deferred:
+#   sub-gap          : needs reliable inbound-sender tracking we don't have yet
+#   schedule-slip    : no schedule signal source without graph
+#   permit-delay     : out of scope per original spec
+
+INTERNAL_TOKEN = os.getenv("HAZEL_INTERNAL_TOKEN", "")
+
+
+def _require_internal_token():
+    """Reject request unless X-Internal-Token matches HAZEL_INTERNAL_TOKEN.
+    If the env var is unset, allow only loopback callers — keeps a freshly
+    deployed droplet from accidentally exposing the endpoint."""
+    if not INTERNAL_TOKEN:
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return False
+        return True
+    return request.headers.get("X-Internal-Token", "") == INTERNAL_TOKEN
+
+
+def _sb_get(path, params):
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{path}",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params=params, timeout=8,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+_QUEUE_TYPE_LABELS = {
+    "change-order": "Change order",
+    "email":        "Email reply",
+    "invoice":      "Invoice",
+    "daily-log":    "Daily log",
+    "needs-info":   "Needs info",
+}
+
+
+def _business_days_between(start_dt, end_dt):
+    """Whole business days between two datetimes (Mon-Fri). Good enough for
+    threshold checks; no holiday calendar."""
+    from datetime import timedelta
+    if end_dt < start_dt:
+        return 0
+    days = 0
+    cur = start_dt.date()
+    end = end_dt.date()
+    while cur < end:
+        cur = cur + timedelta(days=1)
+        if cur.weekday() < 5:
+            days += 1
+    return days
+
+
+def _detect_pending_decision(firm_id, project_id):
+    rows = _sb_get("queue_items", {
+        "firm_id": f"eq.{firm_id}",
+        "project_id": f"eq.{project_id}",
+        "status": "eq.active",
+        "select": "id,type,title,created_at",
+        "order": "created_at.asc",
+        "limit": "1",
+    })
+    if not rows:
+        return None
+    from datetime import datetime, timezone
+    oldest = rows[0]
+    created = datetime.fromisoformat(oldest["created_at"].replace("Z", "+00:00"))
+    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+    if age_hours < 48:
+        return None
+    label = _QUEUE_TYPE_LABELS.get(oldest.get("type") or "", "Item")
+    days = max(1, round(age_hours / 24))
+    sev = "red" if age_hours > 72 else "yellow"
+    title = oldest.get("title") or label
+    desc = f"{title} pending {days} day{'s' if days != 1 else ''}"
+    return {"severity": sev, "description": desc}
+
+
+def _detect_unapproved_co(firm_id, project_id):
+    rows = _sb_get("queue_items", {
+        "firm_id": f"eq.{firm_id}",
+        "project_id": f"eq.{project_id}",
+        "status": "eq.active",
+        "type": "eq.change-order",
+        "select": "id,title,created_at",
+        "order": "created_at.asc",
+        "limit": "1",
+    })
+    if not rows:
+        return None
+    from datetime import datetime, timezone
+    oldest = rows[0]
+    created = datetime.fromisoformat(oldest["created_at"].replace("Z", "+00:00"))
+    bdays = _business_days_between(created, datetime.now(timezone.utc))
+    if bdays < 5:
+        return None
+    title = oldest.get("title") or "Change order"
+    return {
+        "severity": "red",
+        "description": f"{title} awaiting approval — {bdays} business days",
+    }
+
+
+def _detect_budget_variance(firm_id, project_id):
+    rows = _sb_get("qbo_job_cost_cache", {
+        "firm_id": f"eq.{firm_id}",
+        "project_id": f"eq.{project_id}",
+        "select": "cost_code,cost_code_name,budgeted_amount,actual_amount",
+    })
+    if not rows:
+        return None
+    worst_pct = 0.0
+    worst_row = None
+    for row in rows:
+        try:
+            b = float(row.get("budgeted_amount") or 0)
+            a = float(row.get("actual_amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if b <= 0:
+            continue
+        pct = (a - b) / b
+        if pct > worst_pct:
+            worst_pct = pct
+            worst_row = row
+    if worst_pct <= 0.05 or not worst_row:
+        return None
+    name = worst_row.get("cost_code_name") or worst_row.get("cost_code") or "a cost code"
+    over = float(worst_row["actual_amount"]) - float(worst_row["budgeted_amount"])
+    sev = "red" if worst_pct > 0.10 else "yellow"
+    if sev == "red":
+        return {"severity": sev, "description": f"Over budget on {name} by ${int(over):,}"}
+    return {"severity": sev, "description": f"Trending over budget on {name}"}
+
+
+_DETECTORS = [
+    ("pending-decision", _detect_pending_decision),
+    ("unapproved-co",    _detect_unapproved_co),
+    ("budget-variance",  _detect_budget_variance),
+]
+
+
+def _upsert_risk(firm_id, project_id, category, finding):
+    """Idempotent upsert keyed on (project_id, category). When finding is
+    None and an active row exists, mark it resolved."""
+    existing = _sb_get("project_risks", {
+        "project_id": f"eq.{project_id}",
+        "category":   f"eq.{category}",
+        "select": "id,severity,description,resolved",
+        "limit": "1",
+    })
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if finding is None:
+        # Condition cleared. Resolve any existing active row.
+        if existing and not existing[0].get("resolved"):
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/project_risks",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"id": f"eq.{existing[0]['id']}"},
+                json={"resolved": True, "resolved_at": now_iso},
+                timeout=5,
+            )
+        return None
+
+    if existing:
+        # Update if severity or description changed
+        cur = existing[0]
+        changed = (
+            cur.get("severity") != finding["severity"]
+            or cur.get("description") != finding["description"]
+            or cur.get("resolved")
+        )
+        if changed:
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/project_risks",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"id": f"eq.{cur['id']}"},
+                json={
+                    "severity":    finding["severity"],
+                    "description": finding["description"],
+                    "detected_at": now_iso,
+                    "resolved":    False,
+                    "resolved_at": None,
+                },
+                timeout=5,
+            )
+        return finding["severity"]
+
+    requests.post(
+        f"{SUPABASE_URL}/rest/v1/project_risks",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        json={
+            "project_id":  project_id,
+            "firm_id":     firm_id,
+            "category":    category,
+            "severity":    finding["severity"],
+            "description": finding["description"],
+            "detected_at": now_iso,
+        },
+        timeout=5,
+    )
+    return finding["severity"]
+
+
+def _roll_up_status(severities):
+    """Worst-active-severity → projects.status."""
+    s = [x for x in severities if x]
+    if "red" in s:    return "delayed"
+    if "yellow" in s: return "at-risk"
+    return "on-track"
+
+
+def _detect_for_project(firm_id, project_id):
+    """Run all detectors against one project. Returns the rolled-up status."""
+    severities = []
+    for category, fn in _DETECTORS:
+        try:
+            finding = fn(firm_id, project_id)
+        except Exception as e:
+            logging.warning(f"risk_detect[{category}] {project_id[:8]}: {e}")
+            finding = None
+        severities.append(_upsert_risk(firm_id, project_id, category, finding))
+    return _roll_up_status(severities)
+
+
+@app.route("/api/hazel/internal/detect-risks", methods=["POST"])
+def api_detect_risks():
+    if not _require_internal_token():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    firm_id_filter = (body.get("firm_id") or "").strip() or None
+
+    # Resolve target firms
+    if firm_id_filter:
+        firms = [{"id": firm_id_filter}]
+    else:
+        firms = _sb_get("firms", {"select": "id"})
+
+    summary = {"firms": 0, "projects": 0, "errors": []}
+    for firm in firms:
+        firm_id = firm["id"]
+        summary["firms"] += 1
+        try:
+            projects = _sb_get("projects", {
+                "firm_id": f"eq.{firm_id}",
+                "status": "neq.archived",
+                "select": "id,status",
+            })
+        except Exception as e:
+            summary["errors"].append(f"firm {firm_id[:8]}: {e}")
+            continue
+        for p in projects:
+            summary["projects"] += 1
+            try:
+                new_status = _detect_for_project(firm_id, p["id"])
+                if new_status and p.get("status") != new_status:
+                    requests.patch(
+                        f"{SUPABASE_URL}/rest/v1/projects",
+                        headers={**SB_HEADERS, "Content-Type": "application/json"},
+                        params={"id": f"eq.{p['id']}"},
+                        json={"status": new_status},
+                        timeout=5,
+                    )
+            except Exception as e:
+                summary["errors"].append(f"project {p['id'][:8]}: {e}")
+    return jsonify(summary), 200
+
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8700, threaded=True)
