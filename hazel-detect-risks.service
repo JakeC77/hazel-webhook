@@ -1,0 +1,8 @@
+[Unit]
+Description=Hazel risk detection job
+After=hazel-chat-webhook.service
+Requires=hazel-chat-webhook.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl -s -m 60 -X POST -H 'Content-Type: application/json' http://127.0.0.1:8700/api/hazel/internal/detect-risks
