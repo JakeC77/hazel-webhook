@@ -1,0 +1,12 @@
+[Unit]
+Description=Hazel daily briefing scheduler — runs every minute, fires generation for opted-in firms whose configured time matches the current UTC minute
+After=hazel-chat-webhook.service openclaw.service
+# Soft dependency — if the webhook server happens to be down, the scheduler
+# should still run (it talks to Supabase directly + plugin port 18789).
+
+[Service]
+Type=oneshot
+User=openclaw
+WorkingDirectory=/home/openclaw/hazel-chat-webhook
+EnvironmentFile=/home/openclaw/hazel-chat-webhook/.env
+ExecStart=/usr/bin/python3 /home/openclaw/hazel-chat-webhook/briefing_scheduler.py

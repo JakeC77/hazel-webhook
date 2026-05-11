@@ -1,0 +1,13 @@
+[Unit]
+Description=Fire Hazel briefing scheduler every minute
+
+[Timer]
+OnCalendar=*:0/1
+# Granular timer — we need minute-level precision because builders can
+# pick any HH:MM. AccuracySec=10s lets systemd batch the fire near the
+# minute boundary without skewing too far from the configured time.
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
