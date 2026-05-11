@@ -73,30 +73,42 @@ def main():
     current_hhmm = now.strftime("%H:%M")
     today_iso = now.strftime("%Y-%m-%d")
 
-    # 1. Find opted-in firms whose chosen time matches the current UTC minute.
+    # 1. Find opted-in firms. We can't filter on morning_briefing_time
+    #    server-side because PostgREST's `like` operator doesn't apply to
+    #    TIME columns (404). Pull all opted-in firms (small set — there's
+    #    a hard ceiling on how many firms opt in at any given moment) and
+    #    filter the HH:MM match in Python.
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/firm_preferences",
             headers=SB_HEADERS,
             params={
                 "morning_briefing_enabled": "eq.true",
-                "morning_briefing_time":    f"like.{current_hhmm}:%",
                 "select": "firm_id,morning_briefing_time",
             },
             timeout=10,
         )
         r.raise_for_status()
-        rows = r.json()
+        opted_in = r.json()
     except Exception as e:
         log.error(f"Failed to query firm_preferences: {e}")
         sys.exit(1)
+
+    # Filter by HH:MM. morning_briefing_time comes back as "HH:MM:SS"
+    # (Postgres TIME default representation). Compare the first 5 chars.
+    rows = [
+        row for row in opted_in
+        if (row.get("morning_briefing_time") or "")[:5] == current_hhmm
+    ]
 
     if not rows:
         # Quiet tick. Most minutes have no match; logging every minute would
         # flood the journal with 1440 lines/day per firm-time-bucket.
         return
 
-    log.info(f"Tick {current_hhmm} UTC: {len(rows)} opted-in firm(s) match")
+    log.info(
+        f"Tick {current_hhmm} UTC: {len(rows)} of {len(opted_in)} opted-in firm(s) match"
+    )
 
     for row in rows:
         firm_id = row["firm_id"]
