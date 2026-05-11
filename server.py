@@ -280,9 +280,11 @@ def api_preferences_put():
         "jurisdictions", "primary_jurisdiction",
         "daily_digest_enabled",
         # Morning briefing prefs (Trello uFWe99xk + OaV9vSGT). Migration 020
-        # added these columns; the dashboard's Settings UI (Trello 28aKzGpN)
-        # PATCHes them on toggle/picker change.
+        # added the enabled+time columns; migration 027 added sms_enabled.
+        # The dashboard's Settings UI (Trello 28aKzGpN) PATCHes them on
+        # toggle/picker change.
         "morning_briefing_enabled", "morning_briefing_time",
+        "morning_briefing_sms_enabled",
     }
     patch = {k: v for k, v in body.items() if k in allowed}
     if not patch:
