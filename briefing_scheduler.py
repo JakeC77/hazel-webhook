@@ -50,12 +50,15 @@ logging.basicConfig(
 )
 log = logging.getLogger()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+# SUPABASE_URL is hardcoded in server.py (line ~67) rather than .env, so we
+# do the same here to keep the deploy story consistent. Override via env if
+# we ever set up a second Supabase project.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zrolyrtaaaiauigrvusl.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 PLUGIN_URL   = os.getenv("PLUGIN_URL", "http://127.0.0.1:18789")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    log.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in environment")
+if not SUPABASE_KEY:
+    log.error("Missing SUPABASE_SERVICE_KEY in environment")
     sys.exit(1)
 
 SB_HEADERS = {
