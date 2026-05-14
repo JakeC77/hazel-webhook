@@ -1483,18 +1483,18 @@ def api_onboarding_complete():
 
         _send_phone_provisioning_email(firm_id, firm.get("display_name", "Unknown"))
 
-        # Welcome email + intro SMS on first completion only. Both are
+        # Welcome email only on first completion. _send_welcome_email is
         # fire-and-forget — failures are logged and never block the response.
-        # The SMS is the "nice extra" — same info as the email but in the
-        # channel Hazel actually lives in, so the builder sees text-first
-        # office management is real the moment they finish setup.
+        # Intro SMS is NOT fired here — it moved to /api/onboarding/intro-sms
+        # which the wizard calls the moment the user lands on the summary
+        # screen, so the text arrives the same instant they see the Hazel
+        # number on screen. Magic-moment timing.
         if not was_already_complete:
             _send_welcome_email(firm, g.user_id)
-            _send_intro_sms(firm_id, g.user_id)
         else:
             logging.info(
                 f"api_onboarding_complete: firm {firm_id[:8]} re-completion, "
-                "skipping welcome email + intro SMS"
+                "skipping welcome email"
             )
 
         logging.info(f"api_onboarding_complete: firm {firm_id[:8]} onboarding done")
@@ -1502,6 +1502,41 @@ def api_onboarding_complete():
     except Exception as e:
         logging.error(f"api_onboarding_complete: {e}")
         return jsonify({"error": "Failed to complete onboarding"}), 500
+
+
+@app.route("/api/onboarding/intro-sms", methods=["POST"])
+@require_auth
+def api_onboarding_intro_sms():
+    """Fire Hazel's intro text the moment the builder lands on the summary
+    screen of the onboarding wizard — same instant they see the TFN on
+    screen, their phone buzzes from that exact number. Magic-moment timing.
+
+    Idempotent: an intro_sms_sent row in subscription_events short-circuits
+    a re-send if the user navigates back/forth on the wizard or refreshes
+    the page on screen 7. The send-helper itself also logs to the same
+    table on success, so the guard self-heals on the next call.
+    """
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    try:
+        chk = requests.get(
+            f"{SUPABASE_URL}/rest/v1/subscription_events",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}",
+                    "event_type": "eq.intro_sms_sent",
+                    "select": "id", "limit": "1"},
+            timeout=5,
+        )
+        if chk.ok and chk.json():
+            return jsonify({"status": "already_sent"}), 200
+    except Exception as e:
+        # Non-fatal — worst case we send a second SMS. Logged for follow-up.
+        logging.warning(f"api_onboarding_intro_sms: idempotency check failed: {e}")
+
+    _send_intro_sms(firm_id, g.user_id)
+    return jsonify({"status": "queued"}), 200
 
 
 @app.route("/api/team", methods=["GET"])
