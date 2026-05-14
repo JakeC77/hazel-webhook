@@ -4048,7 +4048,10 @@ def api_billing_create_subscription():
         logging.error(f"create_subscription: customer retrieve failed: {e}")
         return jsonify({"error": "Invalid customer"}), 400
     email     = (customer.email or "").strip().lower()
-    md        = customer.metadata or {}
+    # Stripe SDK returns metadata as a StripeObject. Direct .get() on it
+    # raises AttributeError because it routes through __getattr__ ->
+    # __getitem__ and treats "get" as a metadata key. Coerce to a real dict.
+    md = dict(customer.metadata) if customer.metadata else {}
     firm_name  = (md.get("firm_name") or "").strip()
     first_name = (md.get("first_name") or "").strip()
     last_name  = (md.get("last_name") or "").strip()
