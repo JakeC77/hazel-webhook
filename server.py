@@ -1082,10 +1082,14 @@ def api_team():
     if not firm_id:
         return jsonify({"error": "No firm found for this user"}), 404
     try:
+        # Trello ST-02 — pull email/phone overrides from firm_users so the
+        # Team settings UI can show + edit them.
         members_r = requests.get(
             f"{SUPABASE_URL}/rest/v1/firm_users",
             headers={**SB_HEADERS, "Content-Type": "application/json"},
-            params={"firm_id": f"eq.{firm_id}", "select": "id,user_id,role,created_at", "order": "created_at.asc"},
+            params={"firm_id": f"eq.{firm_id}",
+                    "select": "id,user_id,role,created_at,email,phone",
+                    "order": "created_at.asc"},
             timeout=5,
         )
         members_r.raise_for_status()
@@ -1094,13 +1098,17 @@ def api_team():
         invites_r = requests.get(
             f"{SUPABASE_URL}/rest/v1/invite_tokens",
             headers={**SB_HEADERS, "Content-Type": "application/json"},
-            params={"firm_id": f"eq.{firm_id}", "used_at": "is.null", "select": "id,email,created_at,expires_at", "order": "created_at.desc"},
+            params={"firm_id": f"eq.{firm_id}", "used_at": "is.null",
+                    "select": "id,email,phone,created_at,expires_at",
+                    "order": "created_at.desc"},
             timeout=5,
         )
         invites_r.raise_for_status()
         pending_invites = invites_r.json()
 
-        # Enrich with email from auth.users
+        # Enrich with email from auth.users when firm_users.email isn't set.
+        # auth_email stays available as a fallback so the UI can show the
+        # login email when no display override exists.
         user_emails = {}
         for m in members:
             uid = m["user_id"]
@@ -1116,8 +1124,15 @@ def api_team():
                 pass
 
         members_out = [
-            {"id": m["id"], "user_id": m["user_id"], "email": user_emails.get(m["user_id"], ""),
-             "role": m["role"], "created_at": m["created_at"]}
+            {
+                "id": m["id"],
+                "user_id": m["user_id"],
+                "email": (m.get("email") or "").lower() or user_emails.get(m["user_id"], ""),
+                "auth_email": user_emails.get(m["user_id"], ""),
+                "phone": m.get("phone"),
+                "role": m["role"],
+                "created_at": m["created_at"],
+            }
             for m in members
         ]
         return jsonify({"members": members_out, "pending_invites": pending_invites}), 200
@@ -1139,6 +1154,23 @@ def api_invites():
     email = (body.get("email") or "").strip().lower()
     if not email:
         return jsonify({"error": "email is required"}), 400
+    # Optional phone (Trello ST-01). Normalize to E.164-ish by stripping
+    # non-digits and prepending +1 for 10-digit US numbers. Empty phone is
+    # written as null. We do NOT block invite creation on invalid phone —
+    # the field is optional and the owner can fix it later via Edit Team Member.
+    raw_phone = (body.get("phone") or "").strip()
+    phone_normalized = None
+    if raw_phone:
+        digits = "".join(c for c in raw_phone if c.isdigit())
+        if len(digits) == 10:
+            phone_normalized = "+1" + digits
+        elif len(digits) == 11 and digits.startswith("1"):
+            phone_normalized = "+" + digits
+        elif raw_phone.startswith("+") and len(digits) >= 10:
+            phone_normalized = "+" + digits
+        # else: unparseable shape — write null and log, don't reject the invite
+        if phone_normalized is None:
+            logging.info(f"api_invites: phone '{raw_phone}' not parseable; storing null")
 
     # Verify caller is owner
     try:
@@ -1162,7 +1194,14 @@ def api_invites():
         inv_r = requests.post(
             f"{SUPABASE_URL}/rest/v1/invite_tokens",
             headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
-            json={"firm_id": firm_id, "email": email, "token": token, "invited_by": user_id, "expires_at": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat()},
+            json={
+                "firm_id": firm_id,
+                "email": email,
+                "phone": phone_normalized,
+                "token": token,
+                "invited_by": user_id,
+                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
+            },
             timeout=5,
         )
         inv_r.raise_for_status()
@@ -1227,16 +1266,44 @@ def api_invites_accept():
             if datetime.now(timezone.utc) > exp_dt:
                 return jsonify({"error": "Invite token has expired"}), 410
         firm_id = invite["firm_id"]
+        # Trello ST-01: carry through the optional phone + the email captured
+        # on the invite to the firm_users row so the SMS handler can recognize
+        # this team member when they text Hazel.
+        invite_phone = invite.get("phone") or None
+        invite_email = (invite.get("email") or "").lower() or None
 
         # Add to firm (ignore duplicate)
         requests.post(
             f"{SUPABASE_URL}/rest/v1/firm_users",
             headers={**SB_HEADERS, "Content-Type": "application/json",
                      "Prefer": "return=representation,resolution=ignore-duplicates"},
-            json={"firm_id": firm_id, "user_id": user_id, "role": "member",
-                  "invited_by": invite.get("invited_by")},
+            json={
+                "firm_id": firm_id,
+                "user_id": user_id,
+                "role": "member",
+                "invited_by": invite.get("invited_by"),
+                "phone": invite_phone,
+                "email": invite_email,
+            },
             timeout=5,
         )
+
+        # If the row already existed (ignore-duplicates path), patch the
+        # phone + email forward in case they were captured on a re-invite.
+        if invite_phone or invite_email:
+            patch_fields = {}
+            if invite_phone: patch_fields["phone"] = invite_phone
+            if invite_email: patch_fields["email"] = invite_email
+            try:
+                requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/firm_users",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{user_id}"},
+                    json=patch_fields,
+                    timeout=5,
+                )
+            except Exception as e:
+                logging.warning(f"api_invites_accept: forward phone/email patch failed (non-fatal): {e}")
 
         # Mark token used
         requests.patch(
@@ -1247,10 +1314,184 @@ def api_invites_accept():
             timeout=5,
         )
 
+        # Trello ST-01: welcome email on acceptance. Non-fatal — if AgentMail
+        # is unreachable the user is still added to the firm.
+        try:
+            firm_r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/firms",
+                headers={**SB_HEADERS, "Content-Type": "application/json"},
+                params={"id": f"eq.{firm_id}", "select": "display_name", "limit": "1"},
+                timeout=5,
+            )
+            firm_name = (firm_r.json()[0].get("display_name") if firm_r.ok and firm_r.json() else None) or "your firm"
+        except Exception:
+            firm_name = "your firm"
+
+        welcome_to = invite_email
+        if welcome_to and AGENTMAIL_KEY:
+            try:
+                # Hazel's primary inbound SMS number — the verified Telnyx TFN.
+                # Update this constant if the public Hazel number ever changes.
+                HAZEL_PHONE = "+1 (888) 281-2061"
+                DASHBOARD_URL = "https://hazel.haventechsolutions.com/"
+                requests.post(
+                    "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
+                    headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "to": [welcome_to],
+                        "subject": f"You're on the team — here's how to reach Hazel",
+                        "text": (
+                            f"You've been added to {firm_name} on Hazel. "
+                            f"Hazel is your AI back-of-house assistant.\n\n"
+                            f"You can reach her any time by text or call at {HAZEL_PHONE}.\n\n"
+                            f"You can also log in to your dashboard at {DASHBOARD_URL}\n"
+                        ),
+                        "html": (
+                            f"<p>You've been added to <strong>{firm_name}</strong> on Hazel. "
+                            f"Hazel is your AI back-of-house assistant.</p>"
+                            f"<p>You can reach her any time by text or call at "
+                            f"<strong>{HAZEL_PHONE}</strong>.</p>"
+                            f"<p>You can also log in to your dashboard at "
+                            f"<a href=\"{DASHBOARD_URL}\">{DASHBOARD_URL}</a>.</p>"
+                        ),
+                    },
+                    timeout=10,
+                )
+            except Exception as e:
+                logging.warning(f"api_invites_accept welcome email (non-fatal): {e}")
+
+        # Trello ST-01: welcome SMS to the new team member's phone. DEFERRED
+        # pending TCPA / Telnyx opt-in confirmation from Robert — sending
+        # outbound SMS to a new number without prior consent is risky under
+        # carrier rules. When Robert confirms the opt-in story (likely the
+        # ST-03 placeholder), add the Telnyx sendSms call here using
+        # invite_phone as the destination. Copy template:
+        #   "Hi <FirstName>, you've been added to <firm_name> on Hazel.
+        #    Text or call this number any time. Reply STOP to opt out."
+        if invite_phone:
+            logging.info(
+                f"api_invites_accept: skipping welcome SMS to {invite_phone[-4:]} — pending TCPA confirmation (ST-03)"
+            )
+
         logging.info(f"Invite accepted: user {user_id[:8]} joined firm {firm_id[:8]}")
         return jsonify({"status": "accepted", "firm_id": firm_id}), 200
     except Exception as e:
         logging.error(f"api_invites_accept: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/firm-users/<target_user_id>", methods=["PATCH"])
+@require_auth
+def api_firm_users_patch(target_user_id):
+    """Update a team member's display email or phone.
+
+    Trello ST-02. Access rules:
+      - Owner of the firm: may patch ANY firm_users row in their firm.
+      - Member: may patch ONLY their own row. 403 on any other target.
+
+    Body accepts:
+      email — string (optional). Stored on firm_users.email as a display
+              override. Does NOT modify auth.users.email — keeping the auth
+              login email decoupled avoids OAuth + re-verification rabbit
+              holes. The /api/team endpoint falls back to auth email when
+              firm_users.email is null.
+      phone — string (optional). Normalized to E.164 the same way the
+              invite path does it. Empty / unparseable shapes are written
+              as null rather than rejected so a member can clear their
+              phone.
+
+    Either or both may be present. At least one must be present (else 400).
+    """
+    user_id = g.user_id
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+
+    body = request.get_json(force=True) or {}
+    has_email = "email" in body
+    has_phone = "phone" in body
+    if not has_email and not has_phone:
+        return jsonify({"error": "email or phone required"}), 400
+
+    # Resolve caller role + verify target belongs to caller's firm
+    try:
+        caller_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{user_id}",
+                    "select": "role", "limit": "1"},
+            timeout=5,
+        )
+        caller_r.raise_for_status()
+        caller_rows = caller_r.json()
+        if not caller_rows:
+            return jsonify({"error": "Caller not in any firm"}), 403
+        caller_role = caller_rows[0].get("role")
+    except Exception as e:
+        logging.error(f"api_firm_users_patch caller lookup: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+    is_owner = caller_role == "owner"
+    is_self = user_id == target_user_id
+
+    if not is_owner and not is_self:
+        return jsonify({"error": "Only the firm owner can edit other team members"}), 403
+
+    # Verify target exists in this firm (otherwise an owner could try to
+    # PATCH a user_id from a different firm).
+    try:
+        tgt_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{target_user_id}",
+                    "select": "id", "limit": "1"},
+            timeout=5,
+        )
+        tgt_r.raise_for_status()
+        if not tgt_r.json():
+            return jsonify({"error": "Target user is not in your firm"}), 404
+    except Exception as e:
+        logging.error(f"api_firm_users_patch target lookup: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+    patch = {}
+    if has_email:
+        email_val = (body.get("email") or "").strip().lower()
+        patch["email"] = email_val if email_val else None
+    if has_phone:
+        raw_phone = (body.get("phone") or "").strip()
+        if not raw_phone:
+            patch["phone"] = None
+        else:
+            digits = "".join(c for c in raw_phone if c.isdigit())
+            normalized = None
+            if len(digits) == 10:
+                normalized = "+1" + digits
+            elif len(digits) == 11 and digits.startswith("1"):
+                normalized = "+" + digits
+            elif raw_phone.startswith("+") and len(digits) >= 10:
+                normalized = "+" + digits
+            # Unparseable — write null and log. Don't reject the whole patch.
+            if normalized is None:
+                logging.info(f"api_firm_users_patch: phone '{raw_phone}' not parseable; storing null")
+            patch["phone"] = normalized
+
+    try:
+        r = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "return=representation"},
+            params={"firm_id": f"eq.{firm_id}", "user_id": f"eq.{target_user_id}"},
+            json=patch,
+            timeout=5,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return jsonify({"error": "No row updated"}), 404
+        return jsonify({"status": "updated", "firm_user": rows[0]}), 200
+    except Exception as e:
+        logging.error(f"api_firm_users_patch update: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 
