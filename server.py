@@ -26,6 +26,14 @@ app = Flask(__name__)
 CORS_ORIGINS = {
     'https://jakec77.github.io',
     'https://hazel.haventechsolutions.com',
+    # hazel.build hosts the marketing site + Elements-based signup form
+    # (Trello JPVc3FS2 / ST-04). It POSTs to /api/billing/create-setup-intent
+    # and /api/billing/create-subscription before any auth token exists.
+    'https://hazel.build',
+    'https://www.hazel.build',
+    # Local dev for hazel.build (python -m http.server 8000 by default).
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
 }
 
 @app.after_request
@@ -3500,6 +3508,12 @@ STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_EARLY     = os.getenv("STRIPE_PRICE_EARLY", "")
 STRIPE_PRICE_STANDARD  = os.getenv("STRIPE_PRICE_STANDARD", "")
+# Stripe Integration (Trello ST-01 through ST-09) — current $99/mo plan.
+# The original Checkout-based flow (STRIPE_PRICE_EARLY/STANDARD) is being
+# replaced by an Elements-based flow on hazel.build; once the cutover is
+# done we can retire the legacy price env vars.
+STRIPE_PRICE_HAZEL_99       = os.getenv("STRIPE_PRICE_HAZEL_99", "")
+STRIPE_COUPON_GRANDFATHERED = os.getenv("STRIPE_COUPON_GRANDFATHERED", "")
 DASHBOARD_URL          = os.getenv("DASHBOARD_URL", "https://hazel.haventechsolutions.com")
 TOS_URL                = os.getenv("TOS_URL", "")
 DPA_URL                = os.getenv("DPA_URL", "")
@@ -3577,6 +3591,11 @@ def billing_webhook():
             _upsert_subscription(firm_id, obj)
         elif event_type == "customer.subscription.deleted":
             _handle_subscription_deleted(firm_id, obj)
+        elif event_type == "customer.subscription.trial_will_end":
+            # Stripe fires this 3 days before the trial ends. We send a
+            # reminder email (Trello aGCqt1mp / ST-08) but ONLY if the
+            # subscription isn't already canceled.
+            _handle_trial_will_end(firm_id, obj)
         elif event_type == "invoice.payment_succeeded":
             _handle_payment_succeeded(firm_id, obj)
         elif event_type == "invoice.payment_failed":
@@ -3683,6 +3702,186 @@ def _handle_payment_failed(firm_id, invoice_obj):
     )
 
 
+def _handle_trial_will_end(firm_id, sub_obj):
+    """Trello aGCqt1mp / ST-08 — trial reminder email 3 days before charge.
+
+    Stripe fires customer.subscription.trial_will_end ~3 days before the
+    trial ends (configurable in the dashboard). We skip the send if the
+    firm is already canceled to avoid emailing someone who's leaving."""
+    if not firm_id:
+        return
+    # Skip if subscription is already canceled or scheduled to cancel.
+    sub_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}",
+                "select": "status,current_period_end", "limit": "1"},
+        timeout=5,
+    )
+    if sub_r.ok and sub_r.json():
+        status = (sub_r.json()[0].get("status") or "").lower()
+        if status in ("canceled", "incomplete_expired"):
+            logging.info(
+                f"_handle_trial_will_end: firm {firm_id[:8]} already {status}, skipping email"
+            )
+            return
+
+    # trial_end on the sub object is when the actual charge happens
+    trial_end_ts = sub_obj.get("trial_end")
+    _send_trial_reminder_email(firm_id, trial_end_ts)
+
+
+def _send_trial_reminder_email(firm_id: str, trial_end_ts):
+    """Send the "trial ends in 3 days" email via Agentmail. Logs to
+    subscription_events on success. Fire-and-forget — webhook handler
+    must keep returning 200 to Stripe even if email delivery fails."""
+    if not AGENTMAIL_KEY:
+        logging.warning("_send_trial_reminder_email: AGENTMAIL_KEY not set, skipping")
+        return
+    try:
+        # Resolve recipient email: the user who owns this firm
+        fu_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"firm_id": f"eq.{firm_id}", "role": "eq.owner",
+                    "select": "user_id", "limit": "1"},
+            timeout=5,
+        )
+        if not (fu_r.ok and fu_r.json()):
+            logging.warning(f"_send_trial_reminder_email: no owner for firm {firm_id}")
+            return
+        user_id = fu_r.json()[0]["user_id"]
+
+        u_r = requests.get(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+            headers=SB_HEADERS, timeout=5,
+        )
+        u_r.raise_for_status()
+        recipient = (u_r.json().get("email") or "").strip()
+        if not recipient:
+            return
+
+        # Resolve sign-off name + format trial end date
+        firm_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}", "select": "sign_off_name", "limit": "1"},
+            timeout=5,
+        )
+        sign_off = ""
+        if firm_r.ok and firm_r.json():
+            sign_off = (firm_r.json()[0].get("sign_off_name") or "").strip()
+        first_name = sign_off.split()[0] if sign_off else "there"
+
+        from datetime import datetime, timezone
+        if trial_end_ts:
+            trial_end_str = datetime.fromtimestamp(
+                int(trial_end_ts), tz=timezone.utc
+            ).strftime("%B %-d, %Y")
+        else:
+            trial_end_str = "in a few days"
+
+        subject = "Your Hazel trial ends in 3 days"
+        body = (
+            f"Hi {first_name},\n\n"
+            f"Your Hazel free trial ends on {trial_end_str}, at which point "
+            "your card will be charged $99 for the first month.\n\n"
+            "Nothing for you to do if you want to keep going — Hazel will stay "
+            "available without interruption. If you'd rather not continue, you can "
+            "cancel before the trial ends from your dashboard Account page: "
+            "https://hazel.haventechsolutions.com/#/settings/account\n\n"
+            "If you have questions or need help, just reply to this email or "
+            "reach out to support@hazel.build.\n\n"
+            "— Hazel\n"
+        )
+
+        mail_r = requests.post(
+            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}",
+                     "Content-Type": "application/json"},
+            json={"to": [recipient], "subject": subject, "text": body},
+            timeout=10,
+        )
+        if not mail_r.ok:
+            logging.warning(
+                f"_send_trial_reminder_email AgentMail error {mail_r.status_code}: {mail_r.text[:200]}"
+            )
+            return
+        # Log to subscription_events for the audit trail (ST-08 spec)
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/subscription_events",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "return=minimal"},
+            json={"firm_id": firm_id, "event_type": "trial_reminder_sent"},
+            timeout=5,
+        )
+        logging.info(f"_send_trial_reminder_email: sent to {recipient} (firm {firm_id[:8]})")
+    except Exception as e:
+        logging.warning(f"_send_trial_reminder_email (non-fatal): {e}")
+
+
+def _send_signup_welcome_email(firm_id: str, recipient: str, first_name: str, trial_end_ts):
+    """Trello nKlfO9aN / ST-09 — welcome email on trial start.
+
+    Fired inline from /api/billing/create-subscription after the firm row
+    exists. Distinct from _send_welcome_email() (which fires at the END of
+    the onboarding wizard) — this one greets the user the moment their
+    account exists, before they've completed onboarding. Fire-and-forget:
+    failure must not block the signup response."""
+    if not AGENTMAIL_KEY:
+        logging.warning("_send_signup_welcome_email: AGENTMAIL_KEY not set, skipping")
+        return
+    try:
+        from datetime import datetime, timezone
+        if trial_end_ts:
+            trial_end_str = datetime.fromtimestamp(
+                int(trial_end_ts), tz=timezone.utc
+            ).strftime("%B %-d, %Y")
+        else:
+            trial_end_str = "in 30 days"
+
+        subject = "Welcome to Hazel"
+        body = (
+            f"Hi {first_name or 'there'},\n\n"
+            "Welcome to Hazel! Your 30-day free trial has started — "
+            f"your card won't be charged until {trial_end_str}.\n\n"
+            "Three things to do this week:\n\n"
+            "1. Set up your first project in the dashboard so Hazel has somewhere "
+            "to log everything. Sign in at https://hazel.haventechsolutions.com/\n\n"
+            "2. Send Hazel your first text at 1 (888) 281-2061 — anything from "
+            "the field counts. Punch list items, change orders, status updates. "
+            "Text her the way you'd text your office manager.\n\n"
+            "3. Forward an email or two her way at itshazel@agentmail.to — "
+            "invoices, change requests from clients, scheduling threads. She'll "
+            "log them and draft replies for your approval.\n\n"
+            "Questions? Reply to this email or hit support@hazel.build.\n\n"
+            "— Hazel\n"
+        )
+
+        mail_r = requests.post(
+            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}",
+                     "Content-Type": "application/json"},
+            json={"to": [recipient], "subject": subject, "text": body},
+            timeout=10,
+        )
+        if not mail_r.ok:
+            logging.warning(
+                f"_send_signup_welcome_email AgentMail error {mail_r.status_code}: {mail_r.text[:200]}"
+            )
+            return
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/subscription_events",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "return=minimal"},
+            json={"firm_id": firm_id, "event_type": "welcome_email_sent"},
+            timeout=5,
+        )
+        logging.info(f"_send_signup_welcome_email: sent to {recipient} (firm {firm_id[:8]})")
+    except Exception as e:
+        logging.warning(f"_send_signup_welcome_email (non-fatal): {e}")
+
+
 @app.route("/api/billing/status", methods=["GET"])
 @require_auth
 def api_billing_status():
@@ -3703,119 +3902,429 @@ def api_billing_status():
     return jsonify({"status": "none"}), 200
 
 
-@app.route("/api/billing/create-checkout-session", methods=["POST"])
-@require_auth
-def api_billing_create_checkout():
-    """BL-03: Create Stripe Checkout session."""
-    if not STRIPE_SECRET_KEY:
-        return jsonify({"error": "Stripe not configured"}), 503
-    firm_id = g.firm_id
-    if not firm_id:
-        return jsonify({"error": "No firm found"}), 404
-    body = request.get_json(force=True) or {}
-    price_id = body.get("price_id", STRIPE_PRICE_EARLY or STRIPE_PRICE_STANDARD)
-    if not price_id:
-        return jsonify({"error": "No price configured"}), 503
+# ── ST-02: ELEMENTS-BASED SIGN-UP FLOW ────────────────────────────────────────
+# create-setup-intent → confirmCardSetup (frontend) → create-subscription
+#
+# The legacy /api/billing/create-checkout-session route (Stripe Checkout) was
+# removed when ST-04 replaced the redirect flow with embedded Elements.
+# Both calls below are PRE-AUTH (no @require_auth) because the user account
+# doesn't exist yet at sign-up time. The cancel + manual-provision routes
+# below ARE @require_auth — those operate on an existing firm.
+#
+# Password handling: the password is NEVER stored on our side or in Stripe
+# metadata. It's collected at create-setup-intent for early validation,
+# re-sent by the frontend at create-subscription, and passed straight into
+# Supabase Auth's admin API at that point. Lives in JS form state across
+# the two calls and nowhere else.
 
+def _stripe_or_503():
+    """Lazy stripe import + key wiring. Returns (stripe, None) on success,
+    or (None, jsonify(error)) on failure for callers to short-circuit."""
+    if not STRIPE_SECRET_KEY:
+        return None, (jsonify({"error": "Stripe not configured"}), 503)
     try:
         import stripe
-        stripe.api_key = STRIPE_SECRET_KEY
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[{"price": price_id, "quantity": 1}],
-            success_url=f"{DASHBOARD_URL}/#/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{DASHBOARD_URL}/#/billing",
-            metadata={"firm_id": firm_id},
-        )
-        return jsonify({"checkout_url": session.url}), 200
     except ImportError:
-        return jsonify({"error": "stripe package not installed on server"}), 503
+        return None, (jsonify({"error": "stripe package not installed on server"}), 503)
+    stripe.api_key = STRIPE_SECRET_KEY
+    return stripe, None
+
+
+@app.route("/api/billing/create-setup-intent", methods=["POST"])
+def api_billing_create_setup_intent():
+    """ST-02 step 1. Validates form, creates a Stripe Customer record with
+    firm_name + names stashed in metadata, opens a SetupIntent against that
+    customer. Password is validated for shape but NOT stored anywhere.
+
+    Body: { email, password, first_name, last_name, firm_name }
+    Returns: { client_secret, customer_id }
+    """
+    stripe, err = _stripe_or_503()
+    if err:
+        return err
+    body = request.get_json(force=True) or {}
+    email      = (body.get("email") or "").strip().lower()
+    password   = body.get("password") or ""
+    first_name = (body.get("first_name") or "").strip()
+    last_name  = (body.get("last_name") or "").strip()
+    firm_name  = (body.get("firm_name") or "").strip()
+
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email is required"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if not first_name or not last_name:
+        return jsonify({"error": "First and last name are required"}), 400
+    if not firm_name:
+        return jsonify({"error": "Firm name is required"}), 400
+
+    # Early bail if a Supabase auth user with this email already exists —
+    # we'd rather show the error before the card UI mounts than after.
+    try:
+        ex = requests.get(
+            f"{SUPABASE_URL}/auth/v1/admin/users",
+            headers=SB_HEADERS,
+            params={"email": email}, timeout=5,
+        )
+        if ex.ok:
+            users = ex.json().get("users", [])
+            if users:
+                return jsonify({"error": "An account with this email already exists. Please sign in instead."}), 409
     except Exception as e:
-        logging.error(f"create_checkout: {e}")
+        # Non-fatal — worst case the duplicate-email check fails later at
+        # auth user creation time and we return that error.
+        logging.warning(f"create_setup_intent: dup-email precheck failed: {e}")
+
+    try:
+        customer = stripe.Customer.create(
+            email=email,
+            name=f"{first_name} {last_name}".strip(),
+            metadata={
+                "firm_name": firm_name,
+                "first_name": first_name,
+                "last_name": last_name,
+                "source": "hazel.build signup",
+            },
+        )
+        intent = stripe.SetupIntent.create(
+            customer=customer.id,
+            payment_method_types=["card"],
+            usage="off_session",
+        )
+        return jsonify({
+            "client_secret": intent.client_secret,
+            "customer_id": customer.id,
+        }), 200
+    except Exception as e:
+        logging.error(f"create_setup_intent: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/billing/usage", methods=["GET"])
+@app.route("/api/billing/create-subscription", methods=["POST"])
+def api_billing_create_subscription():
+    """ST-02 step 2. Atomically:
+      1. Attach payment method to customer + set as default
+      2. Create the Supabase auth user
+      3. Create firm + firm_users
+      4. Create the Stripe subscription with 30-day trial + firm_id metadata
+      5. Mirror the subscription row into Supabase (webhook will also fire
+         and upsert — both writes are idempotent)
+      6. Send welcome email (ST-09, fire-and-forget)
+
+    Body: { customer_id, payment_method_id, password }
+    Returns: { subscription_id, status, trial_end, email }
+
+    If any step in 1-4 fails, earlier-created Stripe/Supabase resources
+    are cleaned up so a failed signup doesn't leave orphans."""
+    stripe, err = _stripe_or_503()
+    if err:
+        return err
+    if not STRIPE_PRICE_HAZEL_99:
+        return jsonify({"error": "STRIPE_PRICE_HAZEL_99 not configured"}), 503
+
+    body = request.get_json(force=True) or {}
+    customer_id       = (body.get("customer_id") or "").strip()
+    payment_method_id = (body.get("payment_method_id") or "").strip()
+    password          = body.get("password") or ""
+    if not customer_id or not payment_method_id:
+        return jsonify({"error": "customer_id and payment_method_id required"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+    # Pull email + name fields back from Customer metadata (set during
+    # create-setup-intent). This avoids re-trusting client-supplied values.
+    try:
+        customer = stripe.Customer.retrieve(customer_id)
+    except Exception as e:
+        logging.error(f"create_subscription: customer retrieve failed: {e}")
+        return jsonify({"error": "Invalid customer"}), 400
+    email     = (customer.email or "").strip().lower()
+    md        = customer.metadata or {}
+    firm_name  = (md.get("firm_name") or "").strip()
+    first_name = (md.get("first_name") or "").strip()
+    last_name  = (md.get("last_name") or "").strip()
+    if not (email and firm_name and first_name and last_name):
+        return jsonify({"error": "Customer is missing required metadata; please restart signup"}), 400
+
+    # Step 1: attach PM + make it the default for invoices/renewals.
+    try:
+        stripe.PaymentMethod.attach(payment_method_id, customer=customer_id)
+        stripe.Customer.modify(
+            customer_id,
+            invoice_settings={"default_payment_method": payment_method_id},
+        )
+    except Exception as e:
+        logging.error(f"create_subscription: PM attach failed: {e}")
+        return jsonify({"error": f"Could not attach payment method: {str(e)}"}), 400
+
+    # Step 2: create Supabase auth user (email auto-confirmed since they
+    # validated the email implicitly by completing card setup).
+    user_id = None
+    try:
+        u_r = requests.post(
+            f"{SUPABASE_URL}/auth/v1/admin/users",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json={"email": email, "password": password, "email_confirm": True,
+                  "user_metadata": {"first_name": first_name, "last_name": last_name,
+                                     "signup_source": "hazel.build"}},
+            timeout=10,
+        )
+        if not u_r.ok:
+            logging.error(f"create_subscription: auth user creation failed {u_r.status_code}: {u_r.text[:200]}")
+            return jsonify({"error": "Could not create user account"}), 500
+        user_id = u_r.json().get("id")
+        if not user_id:
+            return jsonify({"error": "User created but no id returned"}), 500
+    except Exception as e:
+        logging.error(f"create_subscription: auth user creation exception: {e}")
+        return jsonify({"error": "Could not create user account"}), 500
+
+    # Step 3: create firm + firm_users with rollback on failure.
+    firm_id = None
+    try:
+        f_r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=representation"},
+            json={"display_name": firm_name,
+                  "sign_off_name": f"{first_name} {last_name}".strip(),
+                  "onboarding_step": 1, "onboarding_complete": False},
+            timeout=5,
+        )
+        f_r.raise_for_status()
+        firm_id = f_r.json()[0]["id"]
+
+        fu_r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/firm_users",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"firm_id": firm_id, "user_id": user_id, "role": "owner"},
+            timeout=5,
+        )
+        fu_r.raise_for_status()
+    except Exception as e:
+        logging.error(f"create_subscription: firm setup failed: {e}")
+        # Best-effort cleanup of the orphaned auth user + (maybe) firm row
+        try:
+            if firm_id:
+                requests.delete(f"{SUPABASE_URL}/rest/v1/firms",
+                                headers=SB_HEADERS, params={"id": f"eq.{firm_id}"}, timeout=5)
+            requests.delete(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                            headers=SB_HEADERS, timeout=5)
+        except Exception as rb:
+            logging.error(f"create_subscription: rollback failed: {rb}")
+        return jsonify({"error": "Firm setup failed"}), 500
+
+    # Step 4: create Stripe Subscription with 30-day trial + firm_id in
+    # metadata so the webhook handler can route events without an explicit
+    # lookup. trial_period_days here is what the spec asks for — set on
+    # the subscription (not the price), so it's controlled per signup.
+    sub = None
+    try:
+        sub = stripe.Subscription.create(
+            customer=customer_id,
+            items=[{"price": STRIPE_PRICE_HAZEL_99}],
+            trial_period_days=30,
+            default_payment_method=payment_method_id,
+            metadata={"firm_id": firm_id, "source": "hazel.build signup"},
+            expand=["latest_invoice.payment_intent"],
+        )
+    except Exception as e:
+        logging.error(f"create_subscription: Stripe sub create failed: {e}")
+        # Rollback the firm + user we just created — payment method stays
+        # attached to the Stripe customer, harmless since no sub exists.
+        try:
+            requests.delete(f"{SUPABASE_URL}/rest/v1/firms",
+                            headers=SB_HEADERS, params={"id": f"eq.{firm_id}"}, timeout=5)
+            requests.delete(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                            headers=SB_HEADERS, timeout=5)
+        except Exception as rb:
+            logging.error(f"create_subscription: rollback failed: {rb}")
+        return jsonify({"error": f"Could not create subscription: {str(e)}"}), 500
+
+    # Step 5: mirror the subscription row to Supabase immediately. The webhook
+    # will also upsert this row (idempotent via _upsert_subscription), but
+    # writing now means /api/billing/status returns correct data on first hit
+    # before the webhook arrives.
+    try:
+        from datetime import datetime, timezone
+        sub_row = {
+            "firm_id": firm_id,
+            "stripe_customer_id": customer_id,
+            "stripe_subscription_id": sub.id,
+            "status": sub.status,
+            "amount_cents": 9900,
+            "plan_name": "Hazel",
+            "current_period_start": datetime.fromtimestamp(sub.current_period_start, tz=timezone.utc).isoformat() if sub.current_period_start else None,
+            "current_period_end":   datetime.fromtimestamp(sub.current_period_end,   tz=timezone.utc).isoformat() if sub.current_period_end   else None,
+        }
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/subscriptions",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json=sub_row, timeout=5,
+        )
+    except Exception as e:
+        # Non-fatal — webhook will create the row when it fires.
+        logging.warning(f"create_subscription: mirror row insert failed (webhook will retry): {e}")
+
+    # Step 6: welcome email (ST-09). Inline, fire-and-forget.
+    _send_signup_welcome_email(firm_id, email, first_name, sub.trial_end)
+
+    return jsonify({
+        "subscription_id": sub.id,
+        "status": sub.status,
+        "trial_end": sub.trial_end,
+        "email": email,
+    }), 201
+
+
+@app.route("/api/billing/portal-session", methods=["POST"])
 @require_auth
-def api_billing_usage():
-    """BL-04: Usage visibility for the current billing period."""
-    from datetime import datetime, timezone
+def api_billing_portal_session():
+    """ST-05: open the Stripe Customer Portal for the caller's firm.
+    Returns a one-shot URL the frontend redirects to. The portal's return
+    URL is configured in Stripe Dashboard (Settings > Billing > Customer
+    Portal) — should be set to https://hazel.haventechsolutions.com/#/settings/account."""
+    stripe, err = _stripe_or_503()
+    if err:
+        return err
     firm_id = g.firm_id
     if not firm_id:
         return jsonify({"error": "No firm found"}), 404
 
-    # Get billing period
     sub_r = requests.get(
         f"{SUPABASE_URL}/rest/v1/subscriptions",
         headers={**SB_HEADERS, "Content-Type": "application/json"},
-        params={"firm_id": f"eq.{firm_id}", "select": "current_period_start,current_period_end", "limit": "1"},
+        params={"firm_id": f"eq.{firm_id}", "select": "stripe_customer_id", "limit": "1"},
         timeout=5,
     )
-    if sub_r.ok and sub_r.json() and sub_r.json()[0].get("current_period_start"):
-        period_start = sub_r.json()[0]["current_period_start"]
-    else:
-        # No subscription — use firm creation date
-        firm_r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/firms",
-            headers={**SB_HEADERS, "Content-Type": "application/json"},
-            params={"id": f"eq.{firm_id}", "select": "created_at", "limit": "1"},
+    if not (sub_r.ok and sub_r.json()):
+        return jsonify({"error": "No subscription on file"}), 404
+    customer_id = sub_r.json()[0].get("stripe_customer_id")
+    if not customer_id:
+        return jsonify({"error": "No stripe_customer_id on file"}), 404
+
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{DASHBOARD_URL}/#/settings/account",
+        )
+        return jsonify({"url": session.url}), 200
+    except Exception as e:
+        logging.error(f"api_billing_portal_session: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/billing/cancel", methods=["POST"])
+@require_auth
+def api_billing_cancel():
+    """ST-02 cancel route + ST-06 reason capture. Cancels at period end
+    (not immediate) and writes the reason to subscription_events.
+
+    Body: { reason, reason_detail }
+    Returns: { cancel_at }
+    """
+    stripe, err = _stripe_or_503()
+    if err:
+        return err
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+
+    body = request.get_json(force=True) or {}
+    reason        = (body.get("reason") or "").strip()
+    reason_detail = (body.get("reason_detail") or "").strip()
+    if not reason:
+        return jsonify({"error": "reason is required"}), 400
+
+    # Look up the firm's stripe_subscription_id
+    sub_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}",
+                "select": "stripe_subscription_id,current_period_end", "limit": "1"},
+        timeout=5,
+    )
+    if not (sub_r.ok and sub_r.json()):
+        return jsonify({"error": "No active subscription found"}), 404
+    row = sub_r.json()[0]
+    sub_id = row.get("stripe_subscription_id")
+    if not sub_id:
+        return jsonify({"error": "No stripe_subscription_id on file"}), 404
+
+    try:
+        updated = stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+    except Exception as e:
+        logging.error(f"api_billing_cancel: Stripe modify failed: {e}")
+        return jsonify({"error": "Could not schedule cancellation"}), 500
+
+    # Persist the reason (append-only). Failure here is logged but doesn't
+    # roll back the Stripe cancel — losing the reason is better than the
+    # user thinking they canceled but actually still getting charged.
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/subscription_events",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"firm_id": firm_id, "event_type": "cancel_requested",
+                  "reason": reason, "reason_detail": reason_detail or None},
             timeout=5,
         )
-        period_start = firm_r.json()[0]["created_at"] if firm_r.ok and firm_r.json() else datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        logging.warning(f"api_billing_cancel: reason logging failed: {e}")
 
-    # Count drafts
-    qi_r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/queue_items",
-        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
-        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "select": "id,status", "limit": "0"},
+    cancel_at = updated.cancel_at or updated.current_period_end
+    return jsonify({"cancel_at": cancel_at}), 200
+
+
+@app.route("/api/billing/manual-provision", methods=["POST"])
+def api_billing_manual_provision():
+    """Admin-only: attach the GRANDFATHERED coupon to a firm's subscription.
+    Not exposed in any UI. Auth via the same X-Internal-Token used by other
+    /hazel/internal/* routes — admins/Jake hit this from a terminal.
+
+    Body: { firm_id, coupon_id? }   (coupon_id defaults to STRIPE_COUPON_GRANDFATHERED)
+    Returns: { status, coupon_id }
+    """
+    if not _require_internal_token():
+        return jsonify({"error": "unauthorized"}), 401
+    stripe, err = _stripe_or_503()
+    if err:
+        return err
+
+    body = request.get_json(force=True) or {}
+    firm_id   = (body.get("firm_id") or "").strip()
+    coupon_id = (body.get("coupon_id") or STRIPE_COUPON_GRANDFATHERED).strip()
+    if not firm_id:
+        return jsonify({"error": "firm_id required"}), 400
+    if not coupon_id:
+        return jsonify({"error": "coupon_id required (or set STRIPE_COUPON_GRANDFATHERED)"}), 400
+
+    sub_r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+        headers={**SB_HEADERS, "Content-Type": "application/json"},
+        params={"firm_id": f"eq.{firm_id}",
+                "select": "stripe_subscription_id", "limit": "1"},
         timeout=5,
     )
-    drafts_total = int(qi_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+    if not (sub_r.ok and sub_r.json()):
+        return jsonify({"error": "No subscription found for that firm"}), 404
+    sub_id = sub_r.json()[0].get("stripe_subscription_id")
+    if not sub_id:
+        return jsonify({"error": "No stripe_subscription_id on file"}), 404
 
-    # Count approved without edit (single version = approved without edit)
-    qi_approved_r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/queue_items",
-        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
-        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "status": "eq.approved", "select": "id", "limit": "0"},
-        timeout=5,
-    )
-    drafts_approved = int(qi_approved_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+    try:
+        stripe.Subscription.modify(sub_id, coupon=coupon_id)
+    except Exception as e:
+        logging.error(f"manual_provision: Stripe modify failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
-    # Count emails processed
-    em_r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/inbound_emails",
-        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
-        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "select": "id", "limit": "0"},
-        timeout=5,
-    )
-    emails_processed = int(em_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
+    return jsonify({"status": "ok", "coupon_id": coupon_id, "subscription_id": sub_id}), 200
 
-    # Count invoices
-    inv_r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/invoices",
-        headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "count=exact"},
-        params={"firm_id": f"eq.{firm_id}", "created_at": f"gte.{period_start}", "status": "eq.posted", "select": "id", "limit": "0"},
-        timeout=5,
-    )
-    invoices_posted = int(inv_r.headers.get("content-range", "*/0").split("/")[-1] or 0)
 
-    # Estimated time saved
-    time_saved_minutes = (drafts_total * 12) + (emails_processed * 8) + (invoices_posted * 15)
-    hours = time_saved_minutes // 60
-    mins = time_saved_minutes % 60
-
-    accuracy_pct = round((drafts_approved / drafts_total * 100) if drafts_total > 0 else 0)
-
-    return jsonify({
-        "drafts_generated": drafts_total,
-        "drafts_approved_without_edit": drafts_approved,
-        "emails_processed": emails_processed,
-        "invoices_posted": invoices_posted,
-        "time_saved_display": f"~{hours} hours {mins} minutes" if hours > 0 else f"~{mins} minutes",
-        "time_saved_minutes": time_saved_minutes,
-        "approval_accuracy_pct": accuracy_pct,
-        "period_start": period_start,
-    }), 200
+# /api/billing/usage — REMOVED per Trello mW7S2tgW / ST-05. The Billing view
+# is being replaced by an Account view that surfaces subscription status
+# only; usage stats (drafts generated, approved without edit, emails
+# processed, invoices posted, time saved) are dropped from the codebase.
+# Dashboard's _loadUsage() + usageData state are removed in the matching
+# index.html change.
 
 
 @app.route("/api/legal/accept", methods=["POST"])
