@@ -568,7 +568,12 @@ def api_project_contacts_new(project_id):
     name = (body.get("name") or "").strip()
     if not name:
         return jsonify({"error": "name is required"}), 400
-    allowed = {"name", "type", "company", "trade", "phone", "email", "notes"}
+    # sms_consent + sms_consent_at must be whitelisted so the consent
+    # attestation captured in the modal actually persists. Without this, the
+    # contact would land in the firm roster with sms_consent=null and the
+    # Telnyx TFN / 10DLC compliance audit trail would have a gap.
+    allowed = {"name", "type", "company", "trade", "phone", "email", "notes",
+               "sms_consent", "sms_consent_at"}
     contact = {k: body.get(k) for k in allowed if k in body}
     contact["name"] = name
     contact["firm_id"] = firm_id
