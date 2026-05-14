@@ -3634,19 +3634,44 @@ def billing_webhook():
 
 
 def _upsert_subscription(firm_id, sub_obj):
-    """Create or update a subscription row from a Stripe subscription object."""
+    """Create or update a subscription row from a Stripe subscription object.
+
+    sub_obj is a plain dict (the webhook handler re-parses the verified
+    payload via json.loads so we don't have to wrestle with StripeObject).
+
+    Field locations:
+      - current_period_start/end moved to items[0] in newer Stripe API
+        versions (~2025-XX). We read from items first, fall back to
+        top-level (older API), and finally to trial_start/trial_end for
+        a trialing sub that has neither.
+      - plan_name defaults to the constant 'Hazel' when items[0].price.nickname
+        is null (we don't bother setting a nickname in the Stripe Dashboard).
+    """
     from datetime import datetime, timezone
     if not firm_id:
         return
+
+    items = (sub_obj.get("items") or {}).get("data") or []
+    first_item = items[0] if items else {}
+    first_price = first_item.get("price") or {}
+
+    period_start = first_item.get("current_period_start") or sub_obj.get("current_period_start")
+    period_end   = first_item.get("current_period_end")   or sub_obj.get("current_period_end")
+    # If still missing (e.g. trial-only sub), fall back to trial_start/trial_end.
+    if not period_start:
+        period_start = sub_obj.get("trial_start")
+    if not period_end:
+        period_end = sub_obj.get("trial_end")
+
     row = {
         "firm_id": firm_id,
         "stripe_customer_id": sub_obj.get("customer"),
         "stripe_subscription_id": sub_obj.get("id"),
         "status": sub_obj.get("status", "active"),
-        "plan_name": sub_obj.get("items", {}).get("data", [{}])[0].get("price", {}).get("nickname") if sub_obj.get("items") else None,
-        "amount_cents": sub_obj.get("items", {}).get("data", [{}])[0].get("price", {}).get("unit_amount") if sub_obj.get("items") else None,
-        "current_period_start": datetime.fromtimestamp(sub_obj["current_period_start"], tz=timezone.utc).isoformat() if sub_obj.get("current_period_start") else None,
-        "current_period_end": datetime.fromtimestamp(sub_obj["current_period_end"], tz=timezone.utc).isoformat() if sub_obj.get("current_period_end") else None,
+        "plan_name": first_price.get("nickname") or "Hazel",
+        "amount_cents": first_price.get("unit_amount"),
+        "current_period_start": datetime.fromtimestamp(period_start, tz=timezone.utc).isoformat() if period_start else None,
+        "current_period_end":   datetime.fromtimestamp(period_end,   tz=timezone.utc).isoformat() if period_end   else None,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     # Try update first
