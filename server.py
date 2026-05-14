@@ -974,6 +974,89 @@ def api_firm_context():
         return jsonify({"error": "Internal server error"}), 500
 
 
+def _send_welcome_email(firm: dict, user_id: str):
+    """Welcome email on first onboarding completion (Trello xliplqOs).
+
+    Sent to the authenticated user's email address (resolved from the
+    Supabase Auth admin API). Fire-and-forget: any failure is logged but
+    never raises — onboarding completion must succeed even if email
+    delivery fails.
+
+    Sender note: Agentmail's API is inbox-scoped, so the "from" address
+    is determined by which inbox URL we POST to. Every other send in this
+    file uses itshazel@agentmail.to, so we do the same. If/when a
+    Hazel-branded sender (support@hazel.build, hello@hazel.build, etc.)
+    is provisioned in Agentmail, swap the inbox path here.
+    """
+    if not AGENTMAIL_KEY:
+        logging.warning("_send_welcome_email: AGENTMAIL_KEY not set, skipping")
+        return
+    try:
+        # Resolve recipient email via Supabase Auth admin endpoint
+        u = requests.get(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+            headers=SB_HEADERS,
+            timeout=5,
+        )
+        u.raise_for_status()
+        user_email = (u.json().get("email") or "").strip()
+        if not user_email:
+            logging.warning(f"_send_welcome_email: no email for user {user_id}, skipping")
+            return
+
+        # [FIRST NAME] = first whitespace-separated token of sign_off_name.
+        # Falls back to a generic greeting if sign_off_name is empty (some
+        # firms may complete onboarding without filling that field).
+        sign_off = (firm.get("sign_off_name") or "").strip()
+        first_name = sign_off.split()[0] if sign_off else "there"
+
+        subject = "Welcome to Hazel!"
+        body = (
+            f"Hello {first_name}, welcome to Hazel! Here is some information to help you get started.\n\n"
+            "- You can text Hazel at: 1 (888) 281-2061\n"
+            "- Your dashboard login is here: https://hazel.haventechsolutions.com/\n"
+            "- Contact support@hazel.build if you need any help\n\n"
+            "How To Communicate With Hazel\n\n"
+            "Text Hazel as you would a person.\n\n"
+            "- Punch lists: \"I'm finishing a walk-through at Cedar Hills. "
+            "Garage door opener still isn't in. Flag it. John is the sub for this.\"\n"
+            "- Change orders: \"Client wants to add a gas fireplace in the "
+            "living room. Need a change order for $3,800.\"\n"
+            "- Client updates: \"Send Jim Harlow a status update. "
+            "We're on schedule, siding starts Monday.\"\n\n"
+            "What Happens After You Text\n\n"
+            "Hazel records everything that needs action on the project "
+            "dashboard. She will also draft emails and change orders for "
+            "your approval.\n\n"
+            "- Hazel texts you back with a summary of what she did and "
+            "what needs your approval.\n"
+            "- Log in to your dashboard for a full view.\n"
+            "- Once approved, Hazel sends, files, or records, and then "
+            "logs a permanent audit trail.\n"
+            "- If Hazel isn't sure, she'll ask.\n\n"
+            "Send Her Emails\n\n"
+            "You can also forward emails with project information, such "
+            "as client change requests or invoices. She will log them "
+            "and, if necessary, take action (for example, a schedule "
+            "change). Hazel's email address is: itshazel@agentmail.to\n"
+        )
+
+        mail_r = requests.post(
+            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
+            json={"to": [user_email], "subject": subject, "text": body},
+            timeout=10,
+        )
+        if not mail_r.ok:
+            logging.warning(
+                f"_send_welcome_email AgentMail error {mail_r.status_code}: {mail_r.text[:200]}"
+            )
+        else:
+            logging.info(f"_send_welcome_email: sent welcome to {user_email}")
+    except Exception as e:
+        logging.warning(f"_send_welcome_email (non-fatal): {e}")
+
+
 def _send_phone_provisioning_email(firm_id: str, firm_name: str):
     """Fire-and-forget email to jake@ requesting Hazel phone provisioning."""
     try:
@@ -1048,6 +1131,22 @@ def api_onboarding_complete():
     if not firm_id:
         return jsonify({"error": "No firm found for this user"}), 404
     try:
+        # Read prior state so the welcome email (Trello xliplqOs) only fires
+        # on the FIRST completion — acceptance criteria: "No duplicate emails
+        # are sent if onboarding/complete is called more than once". The
+        # phone-provisioning email is left as-is (pre-existing behavior, out
+        # of scope for xliplqOs); if dedup is wanted there too it can move
+        # inside this same guard later.
+        prev_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}", "select": "onboarding_complete", "limit": "1"},
+            timeout=5,
+        )
+        prev_r.raise_for_status()
+        prev_rows = prev_r.json()
+        was_already_complete = bool(prev_rows and prev_rows[0].get("onboarding_complete"))
+
         patch = {
             "onboarding_complete": True,
             "onboarding_step": 7,
@@ -1066,6 +1165,16 @@ def api_onboarding_complete():
         firm = firm_data[0] if firm_data else {}
 
         _send_phone_provisioning_email(firm_id, firm.get("display_name", "Unknown"))
+
+        # Welcome email only on first completion. _send_welcome_email is
+        # fire-and-forget — failures are logged and never block the response.
+        if not was_already_complete:
+            _send_welcome_email(firm, g.user_id)
+        else:
+            logging.info(
+                f"api_onboarding_complete: firm {firm_id[:8]} re-completion, "
+                "skipping welcome email"
+            )
 
         logging.info(f"api_onboarding_complete: firm {firm_id[:8]} onboarding done")
         return jsonify({"status": "complete", "firm": firm}), 200
