@@ -3542,6 +3542,15 @@ def billing_webhook():
     else:
         event = json.loads(payload)
 
+    # If sig verification went through stripe.Webhook.construct_event,
+    # `event` is a StripeObject — .get() on those raises AttributeError.
+    # Re-parse from the verified raw payload to get a plain dict.
+    if not isinstance(event, dict):
+        try:
+            event = json.loads(payload)
+        except Exception:
+            return jsonify({"error": "Invalid payload"}), 400
+
     event_id = event.get("id", "")
     event_type = event.get("type", "")
 
@@ -4163,17 +4172,43 @@ def api_billing_create_subscription():
     # will also upsert this row (idempotent via _upsert_subscription), but
     # writing now means /api/billing/status returns correct data on first hit
     # before the webhook arrives.
+    #
+    # Stripe API note: in newer API versions (2025-XX+) current_period_start
+    # and current_period_end moved off Subscription onto each subscription
+    # *item*. We read from items first and fall back to top-level fields.
+    #
+    # We convert the StripeObject to a plain dict via JSON round-trip up
+    # front to keep all subsequent field reads predictable.
+    import json as _json
+    from datetime import datetime, timezone
+
+    def _ts_to_iso(ts):
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat() if ts else None
+
+    sub_dict = _json.loads(str(sub))
+    period_start = period_end = None
+    items_data = (sub_dict.get("items") or {}).get("data") or []
+    if items_data:
+        period_start = items_data[0].get("current_period_start")
+        period_end   = items_data[0].get("current_period_end")
+    if period_start is None:
+        period_start = sub_dict.get("current_period_start")
+    if period_end is None:
+        period_end = sub_dict.get("current_period_end")
+    sub_id     = sub_dict.get("id")
+    sub_status = sub_dict.get("status")
+    trial_end  = sub_dict.get("trial_end")
+
     try:
-        from datetime import datetime, timezone
         sub_row = {
             "firm_id": firm_id,
             "stripe_customer_id": customer_id,
-            "stripe_subscription_id": sub.id,
-            "status": sub.status,
+            "stripe_subscription_id": sub_id,
+            "status": sub_status,
             "amount_cents": 9900,
             "plan_name": "Hazel",
-            "current_period_start": datetime.fromtimestamp(sub.current_period_start, tz=timezone.utc).isoformat() if sub.current_period_start else None,
-            "current_period_end":   datetime.fromtimestamp(sub.current_period_end,   tz=timezone.utc).isoformat() if sub.current_period_end   else None,
+            "current_period_start": _ts_to_iso(period_start),
+            "current_period_end":   _ts_to_iso(period_end),
         }
         requests.post(
             f"{SUPABASE_URL}/rest/v1/subscriptions",
@@ -4185,12 +4220,12 @@ def api_billing_create_subscription():
         logging.warning(f"create_subscription: mirror row insert failed (webhook will retry): {e}")
 
     # Step 6: welcome email (ST-09). Inline, fire-and-forget.
-    _send_signup_welcome_email(firm_id, email, first_name, sub.trial_end)
+    _send_signup_welcome_email(firm_id, email, first_name, trial_end)
 
     return jsonify({
-        "subscription_id": sub.id,
-        "status": sub.status,
-        "trial_end": sub.trial_end,
+        "subscription_id": sub_id,
+        "status": sub_status,
+        "trial_end": trial_end,
         "email": email,
     }), 201
 
