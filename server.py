@@ -3960,15 +3960,24 @@ def api_billing_create_setup_intent():
 
     # Early bail if a Supabase auth user with this email already exists —
     # we'd rather show the error before the card UI mounts than after.
+    # Note: Supabase Auth admin's ?email= query parameter is unreliable
+    # (returns the first page of ALL users in some versions). We filter
+    # client-side as a safety net. If this precheck fails entirely the
+    # auth user creation step in create-subscription will surface the
+    # duplicate-email error on its own.
     try:
         ex = requests.get(
             f"{SUPABASE_URL}/auth/v1/admin/users",
             headers=SB_HEADERS,
-            params={"email": email}, timeout=5,
+            params={"email": email, "per_page": "200"}, timeout=5,
         )
         if ex.ok:
             users = ex.json().get("users", [])
-            if users:
+            already_exists = any(
+                (u.get("email") or "").lower() == email
+                for u in users
+            )
+            if already_exists:
                 return jsonify({"error": "An account with this email already exists. Please sign in instead."}), 409
     except Exception as e:
         # Non-fatal — worst case the duplicate-email check fails later at
