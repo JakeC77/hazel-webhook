@@ -240,6 +240,14 @@ def health():
 AGENTMAIL_KEY = os.getenv("AGENTMAIL_KEY", "")
 HAZEL_INBOX   = "itshazel@agentmail.to"
 
+# Telnyx — used directly from server.py for the onboarding intro SMS so the
+# webhook server doesn't have to round-trip through the plugin just to send
+# one text. Same shared TFN (+18882812061) the plugin's TelnyxSmsHandler
+# uses for inbound routing, so a builder's reply lands in the normal SMS
+# pipeline and `matchPhoneGlobally` finds their firm.
+TELNYX_API_KEY     = os.getenv("TELNYX_API_KEY", "")
+TELNYX_FROM_NUMBER = os.getenv("TELNYX_FROM_NUMBER", "+18882812061")
+
 
 # ── EPIC 2: PREFERENCES + CONTACTS ────────────────────────────────────────────
 
@@ -1291,6 +1299,81 @@ def _send_welcome_email(firm: dict, user_id: str):
         logging.warning(f"_send_welcome_email (non-fatal): {e}")
 
 
+def _send_intro_sms(firm_id: str, user_id: str):
+    """Fire a quick introduction SMS the moment a firm completes onboarding.
+
+    Demonstrates Hazel's primary interface (text) the second the builder is
+    ready to use it. Sent from the shared TFN (+18882812061) so the inbound
+    SMS pipeline + matchPhoneGlobally route any reply back to the right firm
+    automatically — they can text back from this same number with anything
+    on their mind and it just works.
+
+    Recipient phone: read from firms.phone (the owner-entered number from
+    onboarding step 2). firm_users.phone is for invited team members and
+    is null for the owner at this point.
+
+    Fire-and-forget: failure is logged, never bubbles up. Onboarding
+    completion must succeed regardless of SMS delivery."""
+    if not TELNYX_API_KEY:
+        logging.warning("_send_intro_sms: TELNYX_API_KEY not set, skipping")
+        return
+    try:
+        # Recipient + first name from the firm row
+        firm_r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/firms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{firm_id}",
+                    "select": "phone,sign_off_name", "limit": "1"},
+            timeout=5,
+        )
+        if not (firm_r.ok and firm_r.json()):
+            logging.warning(f"_send_intro_sms: firm {firm_id[:8]} not found, skipping")
+            return
+        firm_row = firm_r.json()[0]
+        to_number = (firm_row.get("phone") or "").strip()
+        if not to_number:
+            logging.warning(f"_send_intro_sms: no phone on firm {firm_id[:8]}, skipping")
+            return
+        sign_off = (firm_row.get("sign_off_name") or "").strip()
+        first_name = sign_off.split()[0] if sign_off else "there"
+
+        # Body — conversational, no "text me back" invitation per spec
+        # (the welcome email already carries the Hazel number; this SMS is
+        # the nice extra that proves Hazel is real in the channel she'll
+        # actually live in).
+        text = (
+            f"Hi {first_name} — this is Hazel. I'm your new office "
+            "manager. Save this number and text me anything that needs "
+            "to get done: a punch list, a client update, a change "
+            "order. I'll log it, route it to the right project, and "
+            "draft anything that needs to go out."
+        )
+
+        mail_r = requests.post(
+            "https://api.telnyx.com/v2/messages",
+            headers={"Authorization": f"Bearer {TELNYX_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"from": TELNYX_FROM_NUMBER, "to": to_number, "text": text},
+            timeout=10,
+        )
+        if not mail_r.ok:
+            logging.warning(
+                f"_send_intro_sms Telnyx error {mail_r.status_code}: {mail_r.text[:200]}"
+            )
+            return
+        # Audit trail — same table the trial reminder + welcome email use.
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/subscription_events",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "return=minimal"},
+            json={"firm_id": firm_id, "event_type": "intro_sms_sent"},
+            timeout=5,
+        )
+        logging.info(f"_send_intro_sms: sent to {to_number} (firm {firm_id[:8]})")
+    except Exception as e:
+        logging.warning(f"_send_intro_sms (non-fatal): {e}")
+
+
 def _send_phone_provisioning_email(firm_id: str, firm_name: str):
     """Fire-and-forget email to jake@ requesting Hazel phone provisioning."""
     try:
@@ -1400,14 +1483,18 @@ def api_onboarding_complete():
 
         _send_phone_provisioning_email(firm_id, firm.get("display_name", "Unknown"))
 
-        # Welcome email only on first completion. _send_welcome_email is
+        # Welcome email + intro SMS on first completion only. Both are
         # fire-and-forget — failures are logged and never block the response.
+        # The SMS is the "nice extra" — same info as the email but in the
+        # channel Hazel actually lives in, so the builder sees text-first
+        # office management is real the moment they finish setup.
         if not was_already_complete:
             _send_welcome_email(firm, g.user_id)
+            _send_intro_sms(firm_id, g.user_id)
         else:
             logging.info(
                 f"api_onboarding_complete: firm {firm_id[:8]} re-completion, "
-                "skipping welcome email"
+                "skipping welcome email + intro SMS"
             )
 
         logging.info(f"api_onboarding_complete: firm {firm_id[:8]} onboarding done")
