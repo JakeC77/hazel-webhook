@@ -724,6 +724,7 @@ def api_projects_portfolio():
         risks_r = sb("project_risks", {
             "firm_id": f"eq.{firm_id}",
             "resolved": "eq.false",
+            "category": "not.in.(unapproved-co,pending-decision)",
             "select": "project_id,category,severity,description",
         })
         queue_r = sb("queue_items", {
@@ -4796,10 +4797,52 @@ def _detect_budget_variance(firm_id, project_id):
     return {"severity": sev, "description": f"Trending over budget on {name}"}
 
 
+def _detect_punch_list_backlog(firm_id, project_id):
+    rows = _sb_get("punch_list_items", {
+        "firm_id":    f"eq.{firm_id}",
+        "project_id": f"eq.{project_id}",
+        "resolved":   "eq.false",
+        "select":     "id",
+    })
+    count = len(rows)
+    if count < 10:
+        return None
+    sev = "red" if count >= 20 else "yellow"
+    return {
+        "severity": sev,
+        "description": f"{count} open punch list items",
+    }
+
+
+def _detect_overdue_milestone(firm_id, project_id):
+    from datetime import datetime, timezone, date
+    today = date.today().isoformat()
+    rows = _sb_get("project_milestones", {
+        "firm_id":    f"eq.{firm_id}",
+        "project_id": f"eq.{project_id}",
+        "due_date":   f"lt.{today}",
+        "status":     "not.in.(complete)",
+        "select":     "name,due_date,status",
+        "order":      "due_date.asc",
+        "limit":      "1",
+    })
+    if not rows:
+        return None
+    oldest = rows[0]
+    due = datetime.fromisoformat(oldest["due_date"])
+    days_overdue = (datetime.now(timezone.utc).date() - due.date()).days
+    name = oldest.get("name") or "A milestone"
+    sev = "red" if days_overdue > 6 else "yellow"
+    return {
+        "severity": sev,
+        "description": f"{name} overdue by {days_overdue} day{'s' if days_overdue != 1 else ''}",
+    }
+
+
 _DETECTORS = [
-    ("pending-decision", _detect_pending_decision),
-    ("unapproved-co",    _detect_unapproved_co),
-    ("budget-variance",  _detect_budget_variance),
+    ("budget-variance",    _detect_budget_variance),
+    ("punch-list-backlog", _detect_punch_list_backlog),
+    ("overdue-milestone",  _detect_overdue_milestone),
 ]
 
 
