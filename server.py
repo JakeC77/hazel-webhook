@@ -4047,14 +4047,21 @@ def api_billing_create_subscription():
     except Exception as e:
         logging.error(f"create_subscription: customer retrieve failed: {e}")
         return jsonify({"error": "Invalid customer"}), 400
-    email     = (customer.email or "").strip().lower()
-    # Stripe SDK returns metadata as a StripeObject. Direct .get() on it
-    # raises AttributeError because it routes through __getattr__ ->
-    # __getitem__ and treats "get" as a metadata key. Coerce to a real dict.
-    md = dict(customer.metadata) if customer.metadata else {}
-    firm_name  = (md.get("firm_name") or "").strip()
-    first_name = (md.get("first_name") or "").strip()
-    last_name  = (md.get("last_name") or "").strip()
+    email = (customer.email or "").strip().lower()
+    # Stripe SDK's customer.metadata is a StripeObject — both .get() and
+    # dict(...) fail on it for different reasons (StripeObject's __getattr__
+    # treats "get" as a key, and its iteration protocol doesn't expose
+    # string keys to dict's constructor). Direct bracket access with `in`
+    # checks works reliably.
+    md = customer.metadata
+    def _md_str(key):
+        if md is None or key not in md:
+            return ""
+        v = md[key]
+        return v if isinstance(v, str) else ""
+    firm_name  = _md_str("firm_name").strip()
+    first_name = _md_str("first_name").strip()
+    last_name  = _md_str("last_name").strip()
     if not (email and firm_name and first_name and last_name):
         return jsonify({"error": "Customer is missing required metadata; please restart signup"}), 400
 
