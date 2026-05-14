@@ -4004,6 +4004,316 @@ def webhook_supabase_send_email():
     return jsonify({}), 200
 
 
+# ── FILE-INSERT WEBHOOK: HEIC convert + auto analysis ─────────────────────────
+# Trello lMF0d0MQ (auto analyze) + exLqKUSR (HEIC preview conversion).
+#
+# Triggered by a Supabase Database Webhook on `files` INSERT. One download,
+# two passes:
+#
+#   1. HEIC pass (exLqKUSR)
+#      .heic/.heif → convert to JPEG via pillow-heif + Pillow, upload as
+#      project-files/{project_id}/photos/{stem}_converted.jpg, PATCH
+#      files.converted_path. The dashboard renders converted_path so the
+#      builder sees a thumbnail seconds after upload instead of waiting on
+#      the systemd backstop timer.
+#
+#   2. Analyze pass (lMF0d0MQ)
+#      Extract text (pdfplumber for PDFs, python-docx for .docx, raw decode
+#      for txt/md/csv/json/etc.), POST to the plugin's
+#      /hazel/internal/analyze-file endpoint. The plugin runs an agent turn
+#      under the project's dashboard session key and writes Hazel's read of
+#      the file straight to messages.
+#
+# Idempotency:
+#   - analyzed_at flips to now() before the worker spawns, so retries no-op
+#     and a crash mid-analysis won't loop us forever.
+#   - converted_path is set by the HEIC pass itself; the systemd timer
+#     (hazel-heic-convert.timer, 15min cadence) sweeps up rows that the
+#     webhook missed (server down at insert time, transient pillow crash,
+#     backfills).
+#
+# Supabase webhook config (one-time setup in Studio):
+#   Table: files, Events: INSERT
+#   URL:    https://<this-host>/webhook/file-inserted
+#   Headers: Authorization: Bearer <SUPABASE_FILE_WEBHOOK_SECRET>
+#
+# Droplet deps:
+#   pip3 install pdfplumber python-docx pillow-heif Pillow --break-system-packages
+SUPABASE_FILE_WEBHOOK_SECRET = os.getenv("SUPABASE_FILE_WEBHOOK_SECRET", "")
+_TEXT_LIKE_EXTS = {"txt", "md", "csv", "log", "json", "xml", "html", "htm"}
+_HEIC_EXTS      = {"heic", "heif"}
+_MAX_TEXT_CHARS = 20_000  # cap what we ship to the agent
+_JPEG_QUALITY   = 85      # match heic_convert.py
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    try:
+        import io
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text() or ""
+                if t.strip():
+                    out.append(t)
+                if sum(len(s) for s in out) > _MAX_TEXT_CHARS:
+                    break
+        return "\n\n".join(out).strip()
+    except Exception as e:
+        logging.warning(f"extract_pdf_text: {e}")
+        return ""
+
+
+def _extract_docx_text(data: bytes) -> str:
+    try:
+        import io
+        import docx  # python-docx, type: ignore
+        d = docx.Document(io.BytesIO(data))
+        paras = [p.text for p in d.paragraphs if p.text and p.text.strip()]
+        return "\n".join(paras).strip()
+    except Exception as e:
+        logging.warning(f"extract_docx_text: {e}")
+        return ""
+
+
+def _extract_text(data: bytes, ext: str) -> str:
+    ext = (ext or "").lower().lstrip(".")
+    if ext == "pdf":
+        return _extract_pdf_text(data)
+    if ext == "docx":
+        return _extract_docx_text(data)
+    if ext in _TEXT_LIKE_EXTS:
+        try:
+            return data.decode("utf-8", errors="replace")[:_MAX_TEXT_CHARS]
+        except Exception:
+            return ""
+    return ""  # image, heic, xlsx, etc. — let Hazel pull the bytes herself if needed
+
+
+def _convert_heic_to_jpeg(heic_bytes: bytes) -> bytes:
+    """Decode HEIC → JPEG bytes. Mirrors heic_convert.py's logic so the
+    backstop timer and the live webhook produce identical output."""
+    import io
+    import pillow_heif  # type: ignore
+    from PIL import Image, ImageOps  # type: ignore
+    pillow_heif.register_heif_opener()
+    img = Image.open(io.BytesIO(heic_bytes))
+    try:
+        img = ImageOps.exif_transpose(img)  # respect iPhone orientation EXIF
+    except Exception:
+        pass
+    if img.mode != "RGB":
+        img = img.convert("RGB")  # JPEG can't carry alpha
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
+    return out.getvalue()
+
+
+def _heic_pass(file_id: str, project_id: str, storage_path: str, raw_bytes: bytes):
+    """Convert + upload JPEG sibling + persist converted_path. No-ops on failure
+    (the systemd backstop will retry)."""
+    try:
+        jpeg_bytes = _convert_heic_to_jpeg(raw_bytes)
+    except ImportError:
+        logging.error(
+            "file_inserted: pillow-heif/Pillow not installed — "
+            "run: pip3 install pillow-heif Pillow --break-system-packages"
+        )
+        return
+    except Exception as e:
+        logging.warning(f"file_inserted: HEIC decode failed for {storage_path}: {e}")
+        return
+
+    # Path mirrors heic_convert.py exactly so the dashboard renders consistently.
+    from os.path import splitext, basename
+    stem = splitext(basename(storage_path))[0]
+    dest_path = f"{project_id}/photos/{stem}_converted.jpg"
+    try:
+        up = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/project-files/{dest_path}",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "image/jpeg",
+                "x-upsert": "true",  # safe on webhook retry / timer collision
+            },
+            data=jpeg_bytes, timeout=60,
+        )
+        if not up.ok:
+            logging.warning(
+                f"file_inserted: HEIC JPEG upload {up.status_code}: {up.text[:200]}"
+            )
+            return
+    except Exception as e:
+        logging.warning(f"file_inserted: HEIC JPEG upload exception: {e}")
+        return
+
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/files",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            params={"id": f"eq.{file_id}"},
+            json={"converted_path": dest_path},
+            timeout=5,
+        )
+        logging.info(
+            f"file_inserted: HEIC→JPEG {file_id[:8]} converted_path={dest_path}"
+        )
+    except Exception as e:
+        logging.warning(f"file_inserted: HEIC converted_path PATCH exception: {e}")
+
+
+def _process_uploaded_file_async(file_row: dict):
+    """Background worker: download bytes once, then run any passes the file
+    type qualifies for (HEIC conversion, text extraction + analyze handoff)."""
+    file_id      = file_row.get("id") or ""
+    project_id   = file_row.get("project_id") or ""
+    firm_id      = file_row.get("firm_id") or ""
+    storage_path = file_row.get("storage_path") or ""
+    file_name    = file_row.get("name") or "unnamed file"
+    file_type    = (file_row.get("file_type") or "").lower().lstrip(".")
+    category     = file_row.get("category") or "uncategorized"
+
+    if not (file_id and project_id and storage_path):
+        logging.warning(f"file_inserted: skipping incomplete row file_id={file_id}")
+        return
+
+    # Single download — both passes share the bytes.
+    raw_bytes = b""
+    try:
+        dr = requests.get(
+            f"{SUPABASE_URL}/storage/v1/object/project-files/{storage_path}",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            timeout=60,
+        )
+        if not dr.ok:
+            logging.warning(
+                f"file_inserted: storage download {dr.status_code} for {storage_path}"
+            )
+            return
+        raw_bytes = dr.content
+    except Exception as e:
+        logging.warning(f"file_inserted: download exception: {e}")
+        return
+
+    # Pass 1 — HEIC conversion (independent of analyze pass; failures don't
+    # block the analyze handoff because the timer will retry conversion).
+    if file_type in _HEIC_EXTS:
+        _heic_pass(file_id, project_id, storage_path, raw_bytes)
+
+    # Pass 2 — text extraction + analyze handoff. We currently run this for
+    # every file type (per "leave it as is" decision); images fall through
+    # to the plugin with extracted_text="" and Hazel may give a light
+    # acknowledgement. Swap in a skip-set if that proves noisy.
+    extracted_text = _extract_text(raw_bytes, file_type)
+    if extracted_text:
+        logging.info(
+            f"file_inserted: extracted {len(extracted_text)} chars from {file_name}"
+        )
+
+    plugin_url = f"{OPENCLAW_URL}/hazel/internal/analyze-file"
+    headers = {"Content-Type": "application/json"}
+    plugin_token = os.getenv("HAZEL_INTERNAL_TOKEN", "")
+    if plugin_token:
+        headers["X-Internal-Token"] = plugin_token
+    try:
+        pr = requests.post(
+            plugin_url,
+            headers=headers,
+            json={
+                "project_id": project_id,
+                "firm_id": firm_id,
+                "file_id": file_id,
+                "file_name": file_name,
+                "file_type": file_type,
+                "category": category,
+                "storage_path": storage_path,
+                "extracted_text": extracted_text,
+            },
+            timeout=15,  # plugin acks fast and runs the turn async
+        )
+        if not pr.ok:
+            logging.warning(
+                f"file_inserted: plugin returned {pr.status_code} {pr.text[:200]}"
+            )
+    except Exception as e:
+        logging.warning(f"file_inserted: plugin POST exception: {e}")
+
+
+@app.route("/webhook/file-inserted", methods=["POST"])
+def webhook_file_inserted():
+    """Supabase Database Webhook → kick off auto file analysis.
+
+    Body shape (Supabase Database Webhooks):
+      { "type": "INSERT", "table": "files", "record": {...}, "old_record": null, ... }
+    """
+    # Auth: shared secret in Authorization header. Webhooks dashboard lets
+    # you configure arbitrary headers per webhook.
+    if SUPABASE_FILE_WEBHOOK_SECRET:
+        auth = request.headers.get("Authorization", "")
+        expected = f"Bearer {SUPABASE_FILE_WEBHOOK_SECRET}"
+        if auth != expected and auth.replace("bearer ", "Bearer ", 1) != expected:
+            logging.warning("file_inserted: bad/missing Authorization header")
+            return jsonify({"error": "unauthorized"}), 401
+    else:
+        # No secret configured — only allow loopback callers.
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return jsonify({"error": "SUPABASE_FILE_WEBHOOK_SECRET not set"}), 401
+
+    try:
+        payload = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    if (payload.get("type") or "").upper() != "INSERT":
+        return jsonify({"status": "ignored", "reason": "non-insert"}), 200
+
+    record = payload.get("record") or {}
+    file_id      = record.get("id") or ""
+    project_id   = record.get("project_id")
+    archived     = bool(record.get("archived"))
+    analyzed_at  = record.get("analyzed_at")
+    upload_source = (record.get("upload_source") or "").lower()
+
+    # Skip rows the partial index wouldn't have picked up anyway.
+    if not file_id:
+        return jsonify({"status": "ignored", "reason": "missing id"}), 200
+    if not project_id:
+        return jsonify({"status": "ignored", "reason": "no project (inbox MMS)"}), 200
+    if archived:
+        return jsonify({"status": "ignored", "reason": "archived"}), 200
+    if analyzed_at:
+        return jsonify({"status": "ignored", "reason": "already analyzed"}), 200
+
+    # Mark analyzed_at NOW (before handing off) so any retry of this webhook
+    # — or a parallel discovery via the partial index — no-ops. We accept
+    # losing the analysis if the background thread crashes; better than
+    # looping on a poison-pill file.
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/files",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            params={"id": f"eq.{file_id}"},
+            json={"analyzed_at": "now()"},
+            timeout=5,
+        )
+    except Exception as e:
+        logging.warning(f"file_inserted: failed to mark analyzed_at: {e}")
+
+    # Hand off. Daemon thread so a process restart doesn't hang on it.
+    t = threading.Thread(
+        target=_process_uploaded_file_async,
+        args=(record,),
+        daemon=True,
+        name=f"file-analyze-{file_id[:8]}",
+    )
+    t.start()
+    logging.info(
+        f"file_inserted: queued analysis for {file_id[:8]} project={str(project_id)[:8]} source={upload_source or '?'}"
+    )
+    return jsonify({"status": "queued"}), 200
+
+
 # ── RISK DETECTION (Trello YsevHmJQ — Option B, Supabase-only) ────────────────
 # Aggregates per-project signals from Supabase tables into project_risks rows
 # the dashboard's portfolio cards consume directly. No graph/Neo4j dependency.
