@@ -427,6 +427,227 @@ def api_contacts_delete(contact_id):
         return jsonify({"error": "Internal server error"}), 500
 
 
+# ── PROJECT-LEVEL SUB & VENDOR ROSTER (Trello j0kBrZLU) ────────────────────────
+# Builders can pin contacts from the firm-level roster to a specific project,
+# or add net-new contacts that land in both rosters at once. The join lives in
+# `project_contacts` (PK: project_id + contact_id, no other columns). The
+# `contacts` table is firm-scoped via firm_id, which gives us cross-firm
+# isolation: every contact-touching response is filtered to g.firm_id, so a
+# probe with a foreign project_id can't enumerate another firm's contacts.
+
+@app.route("/api/projects/<project_id>/contacts", methods=["GET"])
+@require_auth
+def api_project_contacts_get(project_id):
+    """Contacts assigned to this project — scoped to the caller's firm."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    try:
+        # Step 1: which contact_ids are joined to this project?
+        pc = requests.get(
+            f"{SUPABASE_URL}/rest/v1/project_contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"project_id": f"eq.{project_id}", "select": "contact_id"},
+            timeout=5,
+        )
+        pc.raise_for_status()
+        contact_ids = [r.get("contact_id") for r in pc.json() if r.get("contact_id")]
+        if not contact_ids:
+            return jsonify([]), 200
+
+        # Step 2: fetch those contacts, RE-FILTERED by firm_id so cross-firm
+        # probing never returns rows.
+        ids_csv = ",".join(contact_ids)
+        c = requests.get(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={
+                "id": f"in.({ids_csv})",
+                "firm_id": f"eq.{firm_id}",
+                "order": "name.asc",
+                "select": "*",
+            },
+            timeout=5,
+        )
+        c.raise_for_status()
+        return jsonify(c.json()), 200
+    except Exception as e:
+        logging.error(f"api_project_contacts_get: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/projects/<project_id>/contacts/available", methods=["GET"])
+@require_auth
+def api_project_contacts_available(project_id):
+    """Firm contacts NOT yet on this project — feeds the modal's picker mode."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    try:
+        pc = requests.get(
+            f"{SUPABASE_URL}/rest/v1/project_contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"project_id": f"eq.{project_id}", "select": "contact_id"},
+            timeout=5,
+        )
+        pc.raise_for_status()
+        taken = [r.get("contact_id") for r in pc.json() if r.get("contact_id")]
+
+        params = {"firm_id": f"eq.{firm_id}", "order": "name.asc", "select": "*"}
+        if taken:
+            params["id"] = f"not.in.({','.join(taken)})"
+        c = requests.get(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params=params, timeout=5,
+        )
+        c.raise_for_status()
+        return jsonify(c.json()), 200
+    except Exception as e:
+        logging.error(f"api_project_contacts_available: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/projects/<project_id>/contacts", methods=["POST"])
+@require_auth
+def api_project_contacts_assign(project_id):
+    """Assign an existing firm contact to a project. Idempotent on the
+    composite PK — a duplicate request resolves to 200 rather than 409.
+    Verifies the contact belongs to the caller's firm before joining, so a
+    builder can't bind another firm's contact onto one of their projects."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    contact_id = (body.get("contact_id") or "").strip()
+    if not contact_id:
+        return jsonify({"error": "contact_id required"}), 400
+    try:
+        chk = requests.get(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{contact_id}", "firm_id": f"eq.{firm_id}",
+                    "select": "id", "limit": "1"},
+            timeout=5,
+        )
+        if not (chk.ok and chk.json()):
+            return jsonify({"error": "contact not found"}), 404
+
+        ins = requests.post(
+            f"{SUPABASE_URL}/rest/v1/project_contacts",
+            headers={
+                **SB_HEADERS,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=ignore-duplicates,return=minimal",
+            },
+            json={"project_id": project_id, "contact_id": contact_id},
+            timeout=5,
+        )
+        # 201 (new), 200/204 (resolved-duplicate) all mean "assigned".
+        if ins.status_code in (200, 201, 204):
+            return jsonify({"status": "ok"}), 200
+        logging.warning(
+            f"api_project_contacts_assign: insert returned {ins.status_code}: {ins.text[:200]}"
+        )
+        return jsonify({"error": "assign failed"}), 500
+    except Exception as e:
+        logging.error(f"api_project_contacts_assign: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/projects/<project_id>/contacts/new", methods=["POST"])
+@require_auth
+def api_project_contacts_new(project_id):
+    """Create a net-new contact AND assign it to the project atomically.
+    If the join insert fails, the contact is rolled back so we don't
+    orphan a phantom row in the firm roster."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    body = request.get_json(force=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    allowed = {"name", "type", "company", "trade", "phone", "email", "notes"}
+    contact = {k: body.get(k) for k in allowed if k in body}
+    contact["name"] = name
+    contact["firm_id"] = firm_id
+    try:
+        ins = requests.post(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "return=representation"},
+            json=contact, timeout=5,
+        )
+        ins.raise_for_status()
+        new_contact = ins.json()[0]
+        contact_id = new_contact["id"]
+
+        j = requests.post(
+            f"{SUPABASE_URL}/rest/v1/project_contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json",
+                     "Prefer": "return=minimal"},
+            json={"project_id": project_id, "contact_id": contact_id},
+            timeout=5,
+        )
+        if not j.ok:
+            # Rollback: drop the contact we just created so the firm roster
+            # doesn't accumulate orphans on partial failures.
+            logging.warning(
+                f"api_project_contacts_new: join insert failed {j.status_code}, rolling back contact {contact_id}"
+            )
+            try:
+                requests.delete(
+                    f"{SUPABASE_URL}/rest/v1/contacts",
+                    headers={**SB_HEADERS, "Content-Type": "application/json"},
+                    params={"id": f"eq.{contact_id}", "firm_id": f"eq.{firm_id}"},
+                    timeout=5,
+                )
+            except Exception as rb:
+                logging.error(f"api_project_contacts_new: rollback also failed: {rb}")
+            return jsonify({"error": "Failed to assign new contact to project"}), 500
+
+        return jsonify(new_contact), 201
+    except Exception as e:
+        logging.error(f"api_project_contacts_new: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/projects/<project_id>/contacts/<contact_id>", methods=["DELETE"])
+@require_auth
+def api_project_contacts_unassign(project_id, contact_id):
+    """Detach a contact from this project. Touches `project_contacts` ONLY —
+    the contact remains in the firm roster. Verifies the contact belongs to
+    the caller's firm before deleting so a builder can't unbind a row
+    belonging to a foreign firm."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found"}), 404
+    try:
+        chk = requests.get(
+            f"{SUPABASE_URL}/rest/v1/contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"id": f"eq.{contact_id}", "firm_id": f"eq.{firm_id}",
+                    "select": "id", "limit": "1"},
+            timeout=5,
+        )
+        if not (chk.ok and chk.json()):
+            return jsonify({"error": "contact not found"}), 404
+
+        d = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/project_contacts",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={"project_id": f"eq.{project_id}",
+                    "contact_id": f"eq.{contact_id}"},
+            timeout=5,
+        )
+        d.raise_for_status()
+        return jsonify({"deleted": True}), 200
+    except Exception as e:
+        logging.error(f"api_project_contacts_unassign: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.route("/api/projects", methods=["GET"])
 @require_auth
 def api_projects_get():
