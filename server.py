@@ -737,12 +737,14 @@ def api_projects_portfolio():
         # 2-5: parallelizable in principle; sequential is fine at portfolio
         # cardinalities (4-10 projects). Each query is firm-scoped via the
         # project_id filter through projects we already vetted.
-        risks_r = sb("project_risks", {
-            "firm_id": f"eq.{firm_id}",
-            "resolved": "eq.false",
-            "category": "not.in.(unapproved-co,pending-decision)",
-            "select": "project_id,category,severity,description",
-        })
+        risks_url = (
+            f"{SUPABASE_URL}/rest/v1/project_risks"
+            f"?firm_id=eq.{firm_id}"
+            f"&resolved=eq.false"
+            f"&category=not.in.(unapproved-co,pending-decision)"
+            f"&select=project_id,category,severity,description"
+        )
+        risks_r = requests.get(risks_url, headers={**SB_HEADERS, "Content-Type": "application/json"}, timeout=5)
         queue_r = sb("queue_items", {
             "firm_id": f"eq.{firm_id}",
             "status": "eq.active",
