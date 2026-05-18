@@ -3786,6 +3786,16 @@ def _upsert_subscription(firm_id, sub_obj):
     if not period_end:
         period_end = sub_obj.get("trial_end")
 
+    # cancel_at = unix ts Stripe sets on the sub when cancel_at_period_end
+    # is true. Persisted (Trello hbUCWDMY) so /api/billing/status reflects
+    # the scheduled cancellation across page reloads; gets cleared back to
+    # NULL if cancel_at_period_end is later reversed (user reactivates).
+    cancel_at_ts = sub_obj.get("cancel_at")
+    cancel_at_iso = (
+        datetime.fromtimestamp(cancel_at_ts, tz=timezone.utc).isoformat()
+        if cancel_at_ts else None
+    )
+
     row = {
         "firm_id": firm_id,
         "stripe_customer_id": sub_obj.get("customer"),
@@ -3795,6 +3805,7 @@ def _upsert_subscription(firm_id, sub_obj):
         "amount_cents": first_price.get("unit_amount"),
         "current_period_start": datetime.fromtimestamp(period_start, tz=timezone.utc).isoformat() if period_start else None,
         "current_period_end":   datetime.fromtimestamp(period_end,   tz=timezone.utc).isoformat() if period_end   else None,
+        "cancel_at": cancel_at_iso,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     # Try update first
@@ -4370,11 +4381,47 @@ def api_billing_create_subscription():
     # Step 6: welcome email (ST-09). Inline, fire-and-forget.
     _send_signup_welcome_email(firm_id, email, first_name, trial_end)
 
+    # Step 7: generate a Supabase magic link so the user lands on the
+    # dashboard already authenticated (Trello EYbDzxpz). Robert tried a
+    # client-side password sign-in + localStorage approach but localStorage
+    # is per-origin — hazel.build can't write a session that
+    # hazel.haventechsolutions.com reads. The magic link approach works
+    # cross-origin: Supabase verifies the token at its own endpoint and
+    # forwards to redirect_to with a fresh session attached.
+    #
+    # Non-fatal: if generation fails, frontend falls back to the plain
+    # dashboard URL and the user sees the sign-in screen.
+    magic_link = None
+    try:
+        ml_r = requests.post(
+            f"{SUPABASE_URL}/auth/v1/admin/generate_link",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            json={
+                "type": "magiclink",
+                "email": email,
+                "options": {"redirect_to": f"{DASHBOARD_URL}/"},
+            },
+            timeout=10,
+        )
+        if ml_r.ok:
+            body_json = ml_r.json() or {}
+            magic_link = (
+                body_json.get("action_link")
+                or (body_json.get("properties") or {}).get("action_link")
+            )
+        else:
+            logging.warning(
+                f"create_subscription: magic link generation {ml_r.status_code}: {ml_r.text[:200]}"
+            )
+    except Exception as e:
+        logging.warning(f"create_subscription: magic link generation exception: {e}")
+
     return jsonify({
         "subscription_id": sub_id,
         "status": sub_status,
         "trial_end": trial_end,
         "email": email,
+        "magic_link": magic_link,
     }), 201
 
 
@@ -4472,8 +4519,45 @@ def api_billing_cancel():
     except Exception as e:
         logging.warning(f"api_billing_cancel: reason logging failed: {e}")
 
-    cancel_at = updated.cancel_at or updated.current_period_end
-    return jsonify({"cancel_at": cancel_at}), 200
+    # Pull authoritative cancel_at + period_end from the updated Stripe sub.
+    # Round-trip through JSON since StripeObject's .get() is broken (see
+    # _upsert_subscription notes for the full story).
+    import json as _json
+    from datetime import datetime, timezone
+    sub_dict = _json.loads(str(updated))
+    cancel_at_ts = sub_dict.get("cancel_at")
+    items_data = (sub_dict.get("items") or {}).get("data") or []
+    period_end_ts = (items_data[0].get("current_period_end") if items_data else None) \
+                    or sub_dict.get("current_period_end") \
+                    or sub_dict.get("trial_end")
+    cancel_at_iso = (
+        datetime.fromtimestamp(cancel_at_ts, tz=timezone.utc).isoformat()
+        if cancel_at_ts else None
+    )
+
+    # Trello hbUCWDMY: patch the subscriptions row NOW so /api/billing/status
+    # reflects the scheduled cancellation on the next read — including across
+    # page reloads, which Robert's optimistic-only fix can't survive. The
+    # webhook will also fire customer.subscription.updated shortly and run
+    # _upsert_subscription, which writes the same value (idempotent).
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/subscriptions",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            params={"firm_id": f"eq.{firm_id}"},
+            json={"cancel_at": cancel_at_iso,
+                  "updated_at": datetime.now(timezone.utc).isoformat()},
+            timeout=5,
+        )
+    except Exception as e:
+        logging.warning(f"api_billing_cancel: row patch failed (webhook will retry): {e}")
+
+    # Return unix timestamps (the frontend multiplies by 1000 for Date()).
+    return jsonify({
+        "cancel_at": cancel_at_ts or period_end_ts,
+        "current_period_end": period_end_ts,
+        "status": sub_dict.get("status"),
+    }), 200
 
 
 @app.route("/api/billing/manual-provision", methods=["POST"])
