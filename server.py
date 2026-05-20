@@ -4346,10 +4346,11 @@ def api_billing_create_subscription():
     # the subscription (not the price), so it's controlled per signup.
     sub = None
     try:
-        # Pass promotion_code only when one was resolved at setup-intent
-        # time — Stripe rejects an empty/None value here. The promo_code_id
-        # was stashed in Customer metadata after we validated the user-typed
-        # string against PromotionCode.list, so by this point it's known-good.
+        # Stripe deprecated the top-level promotion_code= param on
+        # Subscription.create in favor of a discounts=[{...}] array.
+        # Pass the resolved promo_code_id (set during create-setup-intent
+        # after validating against PromotionCode.list) only when present —
+        # Stripe rejects an empty/None entry in the array.
         sub_create_kwargs = dict(
             customer=customer_id,
             items=[{"price": STRIPE_PRICE_HAZEL_99}],
@@ -4359,7 +4360,7 @@ def api_billing_create_subscription():
             expand=["latest_invoice.payment_intent"],
         )
         if promo_code_id:
-            sub_create_kwargs["promotion_code"] = promo_code_id
+            sub_create_kwargs["discounts"] = [{"promotion_code": promo_code_id}]
         sub = stripe.Subscription.create(**sub_create_kwargs)
     except Exception as e:
         logging.error(f"create_subscription: Stripe sub create failed: {e}")
@@ -4644,7 +4645,12 @@ def api_billing_manual_provision():
         return jsonify({"error": "No stripe_subscription_id on file"}), 404
 
     try:
-        stripe.Subscription.modify(sub_id, coupon=coupon_id)
+        # Same Stripe API change as create-subscription: top-level coupon=
+        # is deprecated, discounts=[{coupon: ...}] is the new shape.
+        stripe.Subscription.modify(
+            sub_id,
+            discounts=[{"coupon": coupon_id}],
+        )
     except Exception as e:
         logging.error(f"manual_provision: Stripe modify failed: {e}")
         return jsonify({"error": str(e)}), 500
