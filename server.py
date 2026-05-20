@@ -4104,8 +4104,16 @@ def api_billing_create_setup_intent():
     firm_name + names stashed in metadata, opens a SetupIntent against that
     customer. Password is validated for shape but NOT stored anywhere.
 
-    Body: { email, password, first_name, last_name, firm_name }
+    Body: { email, password, first_name, last_name, firm_name,
+            promo_code (optional) }
     Returns: { client_secret, customer_id }
+
+    Promo code handling: if promo_code is provided, we look it up via
+    stripe.PromotionCode.list before creating the Customer. Invalid/inactive
+    codes return 400 with a promo-specific error key so the frontend can
+    highlight the right field. Valid codes get resolved to their internal
+    promo_* ID and stashed in Customer metadata; create-subscription reads
+    that back and passes it to stripe.Subscription.create.
     """
     stripe, err = _stripe_or_503()
     if err:
@@ -4116,6 +4124,7 @@ def api_billing_create_setup_intent():
     first_name = (body.get("first_name") or "").strip()
     last_name  = (body.get("last_name") or "").strip()
     firm_name  = (body.get("firm_name") or "").strip()
+    promo_code = (body.get("promo_code") or "").strip()
 
     if not email or "@" not in email:
         return jsonify({"error": "Valid email is required"}), 400
@@ -4125,6 +4134,30 @@ def api_billing_create_setup_intent():
         return jsonify({"error": "First and last name are required"}), 400
     if not firm_name:
         return jsonify({"error": "Firm name is required"}), 400
+
+    # Validate promo code BEFORE creating the Stripe Customer + SetupIntent
+    # so a typo doesn't leave orphans behind. PromotionCode.list is
+    # case-sensitive but Stripe Dashboard convention is uppercase IDs, so
+    # we upcase as a safety net.
+    promo_code_id = None
+    if promo_code:
+        promo_code_upper = promo_code.upper()
+        try:
+            pc_list = stripe.PromotionCode.list(
+                code=promo_code_upper, active=True, limit=1,
+            )
+            if not pc_list.data:
+                return jsonify({
+                    "error": "Promo code not valid or expired",
+                    "field": "promo_code",
+                }), 400
+            promo_code_id = pc_list.data[0].id
+        except Exception as e:
+            logging.error(f"create_setup_intent: promo code lookup failed: {e}")
+            return jsonify({
+                "error": "Could not validate promo code, please try again",
+                "field": "promo_code",
+            }), 500
 
     # Early bail if a Supabase auth user with this email already exists —
     # we'd rather show the error before the card UI mounts than after.
@@ -4153,15 +4186,19 @@ def api_billing_create_setup_intent():
         logging.warning(f"create_setup_intent: dup-email precheck failed: {e}")
 
     try:
+        cust_metadata = {
+            "firm_name": firm_name,
+            "first_name": first_name,
+            "last_name": last_name,
+            "source": "hazel.build signup",
+        }
+        if promo_code_id:
+            cust_metadata["promo_code"] = promo_code  # user-typed string
+            cust_metadata["promo_code_id"] = promo_code_id
         customer = stripe.Customer.create(
             email=email,
             name=f"{first_name} {last_name}".strip(),
-            metadata={
-                "firm_name": firm_name,
-                "first_name": first_name,
-                "last_name": last_name,
-                "source": "hazel.build signup",
-            },
+            metadata=cust_metadata,
         )
         intent = stripe.SetupIntent.create(
             customer=customer.id,
@@ -4230,6 +4267,9 @@ def api_billing_create_subscription():
     firm_name  = _md_str("firm_name").strip()
     first_name = _md_str("first_name").strip()
     last_name  = _md_str("last_name").strip()
+    # Resolved promotion_code ID (set by create-setup-intent if user typed
+    # a valid promo code). May be empty string if no code was provided.
+    promo_code_id = _md_str("promo_code_id").strip() or None
     if not (email and firm_name and first_name and last_name):
         return jsonify({"error": "Customer is missing required metadata; please restart signup"}), 400
 
@@ -4306,7 +4346,11 @@ def api_billing_create_subscription():
     # the subscription (not the price), so it's controlled per signup.
     sub = None
     try:
-        sub = stripe.Subscription.create(
+        # Pass promotion_code only when one was resolved at setup-intent
+        # time — Stripe rejects an empty/None value here. The promo_code_id
+        # was stashed in Customer metadata after we validated the user-typed
+        # string against PromotionCode.list, so by this point it's known-good.
+        sub_create_kwargs = dict(
             customer=customer_id,
             items=[{"price": STRIPE_PRICE_HAZEL_99}],
             trial_period_days=30,
@@ -4314,6 +4358,9 @@ def api_billing_create_subscription():
             metadata={"firm_id": firm_id, "source": "hazel.build signup"},
             expand=["latest_invoice.payment_intent"],
         )
+        if promo_code_id:
+            sub_create_kwargs["promotion_code"] = promo_code_id
+        sub = stripe.Subscription.create(**sub_create_kwargs)
     except Exception as e:
         logging.error(f"create_subscription: Stripe sub create failed: {e}")
         # Rollback the firm + user we just created — payment method stays
