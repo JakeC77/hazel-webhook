@@ -3796,16 +3796,39 @@ def _upsert_subscription(firm_id, sub_obj):
         if cancel_at_ts else None
     )
 
-    # Discount info — Stripe attaches via discounts[] (the new shape). We
-    # mirror percent_off so the Account view can show the actual amount
-    # the builder will be charged, not the hardcoded $99 base price.
-    # Cleared back to NULL when no discount is on the sub, so removing a
-    # coupon via the Customer Portal will reflect on next refresh.
+    # Discount info — Stripe attaches via discounts[]. Each entry has
+    # source: {coupon: "<coupon_id_str>", type: "coupon"} — note the
+    # coupon ID is a STRING, not an expanded object. To get percent_off
+    # / amount_off we'd need either deep-expand the sub on retrieve OR
+    # fetch the coupon directly. We do the latter once per webhook event
+    # when a discount is present (acceptable — discounts are rare events,
+    # not every page load).
+    #
+    # Both columns get cleared back to NULL when no discount is on the
+    # sub, so removing a coupon via the Customer Portal reflects on next
+    # refresh.
     discount_percent_off = None
+    discount_amount_off_cents = None
     discounts = sub_obj.get("discounts") or []
     if discounts:
-        first_discount_coupon = (discounts[0].get("coupon") or {}) if isinstance(discounts[0], dict) else {}
-        discount_percent_off = first_discount_coupon.get("percent_off")
+        first = discounts[0] if isinstance(discounts[0], dict) else {}
+        source = first.get("source") or {}
+        coupon_ref = source.get("coupon")
+        if isinstance(coupon_ref, dict):
+            # Already expanded — read directly.
+            discount_percent_off = coupon_ref.get("percent_off")
+            discount_amount_off_cents = coupon_ref.get("amount_off")
+        elif isinstance(coupon_ref, str) and coupon_ref:
+            # Just an ID — retrieve the coupon. Lazy import + lazy api key
+            # so this still works when the webhook handler is the caller.
+            try:
+                import stripe as _stripe
+                _stripe.api_key = STRIPE_SECRET_KEY
+                cpn = _stripe.Coupon.retrieve(coupon_ref)
+                discount_percent_off = cpn.percent_off
+                discount_amount_off_cents = cpn.amount_off
+            except Exception as e:
+                logging.warning(f"_upsert_subscription: coupon retrieve failed: {e}")
 
     row = {
         "firm_id": firm_id,
@@ -3818,6 +3841,7 @@ def _upsert_subscription(firm_id, sub_obj):
         "current_period_end":   datetime.fromtimestamp(period_end,   tz=timezone.utc).isoformat() if period_end   else None,
         "cancel_at": cancel_at_iso,
         "discount_percent_off": discount_percent_off,
+        "discount_amount_off_cents": discount_amount_off_cents,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     # Try update first
@@ -4419,13 +4443,27 @@ def api_billing_create_subscription():
     trial_end  = sub_dict.get("trial_end")
 
     # Extract discount info from the created sub so the Account view can
-    # show the discounted price immediately (without waiting on the webhook
-    # to fire customer.subscription.updated). Same percent_off field that
-    # _upsert_subscription reads from sub_obj.discounts[0].coupon.
+    # show the discounted price immediately (without waiting on the
+    # customer.subscription.updated webhook). Mirror the same logic
+    # _upsert_subscription uses: read discounts[0].source.coupon (which
+    # is a STRING ID in Stripe's current schema, not an expanded object),
+    # then retrieve the coupon to get its percent_off / amount_off.
     sub_discount_pct = None
+    sub_discount_amt = None
     sub_discounts = sub_dict.get("discounts") or []
     if sub_discounts and isinstance(sub_discounts[0], dict):
-        sub_discount_pct = (sub_discounts[0].get("coupon") or {}).get("percent_off")
+        src = sub_discounts[0].get("source") or {}
+        cpn_ref = src.get("coupon")
+        if isinstance(cpn_ref, dict):
+            sub_discount_pct = cpn_ref.get("percent_off")
+            sub_discount_amt = cpn_ref.get("amount_off")
+        elif isinstance(cpn_ref, str) and cpn_ref:
+            try:
+                cpn = stripe.Coupon.retrieve(cpn_ref)
+                sub_discount_pct = cpn.percent_off
+                sub_discount_amt = cpn.amount_off
+            except Exception as e:
+                logging.warning(f"create_subscription: coupon retrieve failed: {e}")
 
     try:
         sub_row = {
@@ -4438,6 +4476,7 @@ def api_billing_create_subscription():
             "current_period_start": _ts_to_iso(period_start),
             "current_period_end":   _ts_to_iso(period_end),
             "discount_percent_off": sub_discount_pct,
+            "discount_amount_off_cents": sub_discount_amt,
         }
         requests.post(
             f"{SUPABASE_URL}/rest/v1/subscriptions",
