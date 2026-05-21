@@ -3796,6 +3796,17 @@ def _upsert_subscription(firm_id, sub_obj):
         if cancel_at_ts else None
     )
 
+    # Discount info — Stripe attaches via discounts[] (the new shape). We
+    # mirror percent_off so the Account view can show the actual amount
+    # the builder will be charged, not the hardcoded $99 base price.
+    # Cleared back to NULL when no discount is on the sub, so removing a
+    # coupon via the Customer Portal will reflect on next refresh.
+    discount_percent_off = None
+    discounts = sub_obj.get("discounts") or []
+    if discounts:
+        first_discount_coupon = (discounts[0].get("coupon") or {}) if isinstance(discounts[0], dict) else {}
+        discount_percent_off = first_discount_coupon.get("percent_off")
+
     row = {
         "firm_id": firm_id,
         "stripe_customer_id": sub_obj.get("customer"),
@@ -3806,6 +3817,7 @@ def _upsert_subscription(firm_id, sub_obj):
         "current_period_start": datetime.fromtimestamp(period_start, tz=timezone.utc).isoformat() if period_start else None,
         "current_period_end":   datetime.fromtimestamp(period_end,   tz=timezone.utc).isoformat() if period_end   else None,
         "cancel_at": cancel_at_iso,
+        "discount_percent_off": discount_percent_off,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     # Try update first
@@ -4406,6 +4418,15 @@ def api_billing_create_subscription():
     sub_status = sub_dict.get("status")
     trial_end  = sub_dict.get("trial_end")
 
+    # Extract discount info from the created sub so the Account view can
+    # show the discounted price immediately (without waiting on the webhook
+    # to fire customer.subscription.updated). Same percent_off field that
+    # _upsert_subscription reads from sub_obj.discounts[0].coupon.
+    sub_discount_pct = None
+    sub_discounts = sub_dict.get("discounts") or []
+    if sub_discounts and isinstance(sub_discounts[0], dict):
+        sub_discount_pct = (sub_discounts[0].get("coupon") or {}).get("percent_off")
+
     try:
         sub_row = {
             "firm_id": firm_id,
@@ -4416,6 +4437,7 @@ def api_billing_create_subscription():
             "plan_name": "Hazel",
             "current_period_start": _ts_to_iso(period_start),
             "current_period_end":   _ts_to_iso(period_end),
+            "discount_percent_off": sub_discount_pct,
         }
         requests.post(
             f"{SUPABASE_URL}/rest/v1/subscriptions",
