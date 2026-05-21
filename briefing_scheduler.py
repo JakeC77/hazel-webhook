@@ -26,12 +26,13 @@ The opt-in gate is enforced by the SQL filter — no exception path. Triple-
 checked: scheduler filter + plugin endpoint (also pulls firm context only
 when firmId resolved) + migration 024 default.
 
-Time handling: morning_briefing_time is stored as Postgres TIME (HH:MM:SS).
-The Settings UI saves whatever the user picked in the <input type="time">,
-which is the BUILDER'S LOCAL TIME. We compare against UTC now. v1 known-
-issue: a builder in Pacific Time picking 7:00 AM gets a briefing at 7:00
-UTC = 11pm PT the night before. Timezone-aware scheduling is a follow-up
-(would need a per-firm timezone column).
+Time handling: morning_briefing_time is stored as Postgres TIME (HH:MM:SS),
+representing the BUILDER'S LOCAL TIME (whatever the user picked in the
+Settings <input type="time">). Per-firm timezone is read from firms.timezone
+(IANA string, default 'America/Los_Angeles' per migration 006). For each
+tick we compute "now in that firm's timezone" and HH:MM-compare against
+the configured time. So a Pacific-time firm picking 7:00 AM fires at
+07:00 PT (= 15:00 UTC during PDT), not at 07:00 UTC.
 
 Logging is intentionally quiet on idle ticks — there's a tick every minute,
 and at any given minute most firms won't match. We only log when there's
@@ -43,6 +44,7 @@ import sys
 import logging
 import requests
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,23 +70,41 @@ SB_HEADERS = {
 }
 
 
+DEFAULT_TZ = "America/Los_Angeles"
+
+
+def _firm_local_hhmm(now_utc: datetime, tz_name: str) -> str:
+    """Return current HH:MM in the firm's local timezone. Falls back to
+    America/Los_Angeles if the stored tz string is missing or unknown
+    (e.g., typo, deprecated TZ name) so a bad value never silently
+    suppresses a firm's briefings."""
+    try:
+        tz = ZoneInfo(tz_name or DEFAULT_TZ)
+    except ZoneInfoNotFoundError:
+        log.warning(f"Unknown timezone {tz_name!r}, falling back to {DEFAULT_TZ}")
+        tz = ZoneInfo(DEFAULT_TZ)
+    return now_utc.astimezone(tz).strftime("%H:%M")
+
+
 def main():
     now = datetime.now(timezone.utc)
-    current_hhmm = now.strftime("%H:%M")
     today_iso = now.strftime("%Y-%m-%d")
 
-    # 1. Find opted-in firms. We can't filter on morning_briefing_time
-    #    server-side because PostgREST's `like` operator doesn't apply to
-    #    TIME columns (404). Pull all opted-in firms (small set — there's
-    #    a hard ceiling on how many firms opt in at any given moment) and
-    #    filter the HH:MM match in Python.
+    # 1. Find opted-in firms with their timezones via PostgREST embedded
+    #    select. We can't filter morning_briefing_time server-side because
+    #    PostgREST's `like` operator doesn't apply to TIME columns (returns
+    #    404). Pull all opted-in rows (small set — there's a hard ceiling
+    #    on how many firms opt in at any given minute) and filter the
+    #    HH:MM match per-firm in Python after timezone conversion.
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/firm_preferences",
             headers=SB_HEADERS,
             params={
                 "morning_briefing_enabled": "eq.true",
-                "select": "firm_id,morning_briefing_time",
+                # `firms(timezone)` is PostgREST embedded select via the FK
+                # from firm_preferences.firm_id -> firms.id.
+                "select": "firm_id,morning_briefing_time,firms(timezone)",
             },
             timeout=10,
         )
@@ -94,12 +114,17 @@ def main():
         log.error(f"Failed to query firm_preferences: {e}")
         sys.exit(1)
 
-    # Filter by HH:MM. morning_briefing_time comes back as "HH:MM:SS"
-    # (Postgres TIME default representation). Compare the first 5 chars.
-    rows = [
-        row for row in opted_in
-        if (row.get("morning_briefing_time") or "")[:5] == current_hhmm
-    ]
+    # For each opted-in firm, compute current HH:MM in its local timezone
+    # and compare against the configured morning_briefing_time.
+    rows = []
+    for row in opted_in:
+        configured = (row.get("morning_briefing_time") or "")[:5]
+        if not configured:
+            continue
+        firm_obj = row.get("firms") or {}
+        tz_name = firm_obj.get("timezone") or DEFAULT_TZ
+        if _firm_local_hhmm(now, tz_name) == configured:
+            rows.append({**row, "_resolved_tz": tz_name})
 
     if not rows:
         # Quiet tick. Most minutes have no match; logging every minute would
@@ -107,11 +132,12 @@ def main():
         return
 
     log.info(
-        f"Tick {current_hhmm} UTC: {len(rows)} of {len(opted_in)} opted-in firm(s) match"
+        f"Tick {now.strftime('%H:%M')} UTC: {len(rows)} of {len(opted_in)} opted-in firm(s) match local time"
     )
 
     for row in rows:
         firm_id = row["firm_id"]
+        tz_name = row.get("_resolved_tz") or DEFAULT_TZ
         try:
             # 2. Idempotency check
             er = requests.get(
@@ -129,7 +155,7 @@ def main():
             existing = er.json()
             if existing:
                 log.info(
-                    f"Firm {firm_id[:8]}: briefing for {today_iso} already exists "
+                    f"Firm {firm_id[:8]} ({tz_name}): briefing for {today_iso} already exists "
                     f"(sent_sms={existing[0].get('sent_sms')}) — skipping"
                 )
                 continue
@@ -145,14 +171,14 @@ def main():
             pr.raise_for_status()
             result = pr.json()
             log.info(
-                f"Firm {firm_id[:8]}: generated. "
+                f"Firm {firm_id[:8]} ({tz_name}): generated. "
                 f"briefing_id={(result.get('briefing_id') or '')[:8]} "
                 f"sent_sms={result.get('sent_sms')} "
                 f"generated={result.get('generated')} "
                 f"reason={result.get('reason')}"
             )
         except Exception as e:
-            log.error(f"Firm {firm_id[:8]}: error - {e}")
+            log.error(f"Firm {firm_id[:8]} ({tz_name}): error - {e}")
             # Continue to the next firm; one bad firm shouldn't fail the tick.
 
 

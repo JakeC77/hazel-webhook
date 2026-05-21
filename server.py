@@ -851,8 +851,15 @@ def api_morning_briefing_today():
     v14QKFcI's portfolio briefing component.
 
     Date is computed in UTC. The briefing scheduler uses the same convention
-    when writing rows, so a firm's briefing for 'today' is keyed off the UTC
-    date the scheduler ran. (Per-firm timezone is a future story.)
+    when writing rows: briefing_date is the UTC date at write time, regardless
+    of which timezone fired the scheduler tick. So a 7 AM Pacific briefing
+    that fires at 15:00 UTC is stored with that day's UTC date — which is
+    the same calendar day as the builder's morning except on rare cross-
+    midnight cases. Good enough; not worth a per-firm date calculation.
+
+    (Briefing scheduler reads firms.timezone for the local-time match; this
+    route doesn't need it because the dashboard call happens during the
+    builder's day and 'today UTC' is the right key for that read window.)
     """
     firm_id = g.firm_id
     if not firm_id:
