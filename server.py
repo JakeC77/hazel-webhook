@@ -1375,35 +1375,67 @@ def _send_intro_sms(firm_id: str, user_id: str):
         logging.warning(f"_send_intro_sms (non-fatal): {e}")
 
 
-def _send_phone_provisioning_email(firm_id: str, firm_name: str):
-    """Fire-and-forget email to jake@ requesting Hazel phone provisioning."""
+def _send_signup_notification_email(firm_id: str, firm_name: str, user_id: str = ""):
+    """Internal "new signup landed" email to the Haven team (Trello cegUn2Dj).
+
+    Previously this was named _send_phone_provisioning_email and asked the
+    recipient to provision a per-firm Hazel number via ClawdTalk. That's
+    obsolete now — we standardized on the shared Telnyx TFN, so there's
+    no per-firm provisioning step. The function kept firing from
+    /api/onboarding/complete though, which makes it a natural team-awareness
+    signal for "a new firm just finished setup."
+
+    Recipients: jake@haventechsolutions.com + robert@haventechsolutions.com.
+    Body includes firm name, user email (looked up from Supabase Auth admin
+    if user_id is provided), and a UTC timestamp. Fire-and-forget — never
+    raises, never blocks the calling route's response.
+    """
+    if not AGENTMAIL_KEY:
+        logging.warning("_send_signup_notification_email: AGENTMAIL_KEY not set, skipping")
+        return
     try:
-        if not AGENTMAIL_KEY:
-            logging.warning("_send_phone_provisioning_email: AGENTMAIL_KEY not set, skipping")
-            return
+        # Look up user email if a user_id was passed (it's optional so the
+        # function stays callable from legacy code paths that don't have it).
+        user_email = "(unknown)"
+        if user_id:
+            try:
+                u = requests.get(
+                    f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                    headers=SB_HEADERS, timeout=5,
+                )
+                if u.ok:
+                    user_email = (u.json().get("email") or "(unknown)").strip()
+            except Exception as e:
+                logging.warning(f"_send_signup_notification_email: auth lookup failed: {e}")
+
+        from datetime import datetime, timezone
+        ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
         mail_r = requests.post(
             "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
             headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
             json={
-                "to": ["jake@haventechsolutions.com"],
-                "subject": f"[Hazel] Phone provisioning request — {firm_name}",
+                "to": [
+                    "jake@haventechsolutions.com",
+                    "robert@haventechsolutions.com",
+                ],
+                "subject": f"New Hazel signup: {firm_name}",
                 "text": (
-                    f"A new firm has completed onboarding and needs a Hazel phone number.\n\n"
+                    f"A new firm just completed onboarding setup on Hazel.\n\n"
                     f"Firm: {firm_name}\n"
-                    f"Firm ID: {firm_id}\n\n"
-                    f"Steps:\n"
-                    f"1. Provision a number via ClawdTalk\n"
-                    f"2. Update the firms table:\n"
-                    f"   UPDATE firms SET hazel_phone = '+1XXXXXXXXXX', "
-                    f"hazel_phone_status = 'active' WHERE id = '{firm_id}';\n"
+                    f"Firm ID: {firm_id}\n"
+                    f"User email: {user_email}\n"
+                    f"Timestamp: {ts_utc}\n"
                 ),
             },
             timeout=10,
         )
         if not mail_r.ok:
-            logging.warning(f"_send_phone_provisioning_email AgentMail error: {mail_r.status_code}")
+            logging.warning(
+                f"_send_signup_notification_email AgentMail error {mail_r.status_code}: {mail_r.text[:200]}"
+            )
     except Exception as e:
-        logging.warning(f"_send_phone_provisioning_email (non-fatal): {e}")
+        logging.warning(f"_send_signup_notification_email (non-fatal): {e}")
 
 
 @app.route("/api/firm", methods=["PATCH"])
@@ -1482,20 +1514,25 @@ def api_onboarding_complete():
         firm_data = r.json()
         firm = firm_data[0] if firm_data else {}
 
-        _send_phone_provisioning_email(firm_id, firm.get("display_name", "Unknown"))
-
-        # Welcome email only on first completion. _send_welcome_email is
-        # fire-and-forget — failures are logged and never block the response.
-        # Intro SMS is NOT fired here — it moved to /api/onboarding/intro-sms
-        # which the wizard calls the moment the user lands on the summary
-        # screen, so the text arrives the same instant they see the Hazel
-        # number on screen. Magic-moment timing.
+        # Team notification only on first completion — we don't want jake +
+        # robert to get pinged again every time a user re-hits Finish on
+        # the wizard (it's idempotent, but the email isn't deduped).
+        # Welcome email + intro SMS also gate on this same flag.
+        # Intro SMS specifically: NOT fired here — it moved to
+        # /api/onboarding/intro-sms which the wizard calls the moment the
+        # user lands on the summary screen, so the text arrives the same
+        # instant they see the Hazel number on screen. Magic-moment timing.
         if not was_already_complete:
+            _send_signup_notification_email(
+                firm_id,
+                firm.get("display_name", "Unknown"),
+                g.user_id,
+            )
             _send_welcome_email(firm, g.user_id)
         else:
             logging.info(
                 f"api_onboarding_complete: firm {firm_id[:8]} re-completion, "
-                "skipping welcome email"
+                "skipping welcome email + signup notification"
             )
 
         logging.info(f"api_onboarding_complete: firm {firm_id[:8]} onboarding done")
