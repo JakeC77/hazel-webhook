@@ -1698,7 +1698,12 @@ def api_invites():
         logging.error(f"api_invites role check: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-    # Create invite token record
+    # Create invite token record. datetime is imported per-function in this
+    # file (codebase convention); without the local import this raises
+    # NameError when computing expires_at, which surfaces as a generic
+    # 500 'Failed to create invite' toast on the frontend (the actual
+    # NameError only shows in journalctl). Caused the May-21 invite bug.
+    from datetime import datetime, timezone, timedelta
     token = str(uuid.uuid4())
     try:
         inv_r = requests.post(
