@@ -20,6 +20,32 @@ from flask import Flask, request, jsonify, g
 import jwt
 from jwt import PyJWKClient  # PyJWT
 
+# Sentry error tracking — must initialize BEFORE Flask app construction so
+# the integration patches register correctly. No-op when SENTRY_DSN isn't
+# set, so dev environments without the DSN still boot cleanly.
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.flask import FlaskIntegration
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            integrations=[FlaskIntegration()],
+            # send_default_pii=True attaches request user info to events,
+            # which helps debug per-user failures. We're not subject to
+            # GDPR-equivalent constraints for a small ops team at this scale.
+            send_default_pii=True,
+            # Sample all errors. At our event volume the free tier (5k/mo)
+            # is well above realistic error counts; no need to sample.
+            traces_sample_rate=0.0,  # no perf tracing yet — errors only
+            environment=os.getenv("SENTRY_ENV", "production"),
+        )
+        logging.info("Sentry initialized")
+    except ImportError:
+        logging.warning("SENTRY_DSN set but sentry_sdk not installed — skipping")
+    except Exception as e:
+        logging.warning(f"Sentry init failed (non-fatal): {e}")
+
 app = Flask(__name__)
 
 # ── CORS (API routes only) ────────────────────────────────────────────────────

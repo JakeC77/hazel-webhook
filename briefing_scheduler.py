@@ -52,6 +52,25 @@ logging.basicConfig(
 )
 log = logging.getLogger()
 
+# Sentry: scheduler runs as a separate systemd-invoked Python process every
+# minute, so it gets its own init (the webhook server's init doesn't carry
+# over). Same DSN as the webhook — they're both "hazel-webhook" in Sentry.
+_sentry_dsn = os.getenv("SENTRY_DSN", "")
+if _sentry_dsn:
+    try:
+        import sentry_sdk
+        sentry_sdk.init(
+            dsn=_sentry_dsn,
+            send_default_pii=False,  # no per-user request data in scheduler context
+            traces_sample_rate=0.0,
+            environment=os.getenv("SENTRY_ENV", "production"),
+            # Tag every event from this process as 'briefing-scheduler' so
+            # we can distinguish in Sentry's inbox.
+            release="briefing-scheduler",
+        )
+    except Exception as e:
+        log.warning(f"Sentry init failed (non-fatal): {e}")
+
 # SUPABASE_URL is hardcoded in server.py (line ~67) rather than .env, so we
 # do the same here to keep the deploy story consistent. Override via env if
 # we ever set up a second Supabase project.
