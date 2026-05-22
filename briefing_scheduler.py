@@ -58,6 +58,16 @@ log = logging.getLogger()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zrolyrtaaaiauigrvusl.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 PLUGIN_URL   = os.getenv("PLUGIN_URL", "http://127.0.0.1:18789")
+AGENTMAIL_KEY = os.getenv("AGENTMAIL_KEY", "")
+
+# Internal alert recipients for briefing-SMS-failure notifications. We
+# learned the hard way (2026-05-17 through 2026-05-21) that a silent
+# sent_sms=false is invisible to the team — Robert just stopped getting
+# briefings and no one knew until he asked five days later.
+ALERT_RECIPIENTS = [
+    "jake@haventechsolutions.com",
+    "robert@haventechsolutions.com",
+]
 
 if not SUPABASE_KEY:
     log.error("Missing SUPABASE_SERVICE_KEY in environment")
@@ -71,6 +81,59 @@ SB_HEADERS = {
 
 
 DEFAULT_TZ = "America/Los_Angeles"
+
+
+def _send_briefing_failure_alert(firm_id: str, firm_name: str, briefing_id: str, today_iso: str):
+    """Internal alert to the Haven team when the plugin returns
+    sent_sms=false on a generated briefing. Fires from the scheduler so
+    Telnyx hiccups, malformed phone numbers, encoding failures, etc., all
+    surface to a human within minutes instead of accumulating into a
+    silent multi-day outage. Fire-and-forget — never raises."""
+    if not AGENTMAIL_KEY:
+        log.warning("_send_briefing_failure_alert: AGENTMAIL_KEY not set, skipping")
+        return
+    try:
+        ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        body = (
+            f"Hazel generated a morning briefing for {firm_name} but the SMS to the "
+            "firm's phone failed.\n\n"
+            f"Firm:        {firm_name}\n"
+            f"Firm ID:     {firm_id}\n"
+            f"Briefing ID: {briefing_id}\n"
+            f"Date:        {today_iso}\n"
+            f"Detected:    {ts_utc}\n\n"
+            "The briefing content is still in the database and visible to the "
+            "builder on their dashboard (Settings / Account or the Hazel Chat "
+            "portfolio card). Only the SMS leg failed.\n\n"
+            "Check the plugin logs around the time above for the Telnyx error:\n"
+            f"  ssh root@64.23.173.57 \"journalctl -u openclaw --since '{ts_utc}' | grep -i 'briefing\\\\|telnyx'\"\n\n"
+            "Common causes:\n"
+            "- Telnyx 40302: SMS body exceeded 10-segment cap (recently fixed in formatSmsBody)\n"
+            "- Telnyx 40310: firm.phone not in E.164 / not a real US mobile\n"
+            "- Telnyx outage / API key revoked\n"
+            "- Plugin restart mid-send"
+        )
+        r = requests.post(
+            "https://api.agentmail.to/v0/inboxes/itshazel@agentmail.to/messages/send",
+            headers={"Authorization": f"Bearer {AGENTMAIL_KEY}", "Content-Type": "application/json"},
+            json={
+                "to": ALERT_RECIPIENTS,
+                "subject": f"[Hazel] Briefing SMS failed for {firm_name}",
+                "text": body,
+            },
+            timeout=10,
+        )
+        if not r.ok:
+            log.warning(
+                f"_send_briefing_failure_alert: AgentMail HTTP {r.status_code}: {r.text[:200]}"
+            )
+        else:
+            log.info(
+                f"_send_briefing_failure_alert: notified {len(ALERT_RECIPIENTS)} recipients "
+                f"about firm {firm_id[:8]} / briefing {briefing_id[:8]}"
+            )
+    except Exception as e:
+        log.warning(f"_send_briefing_failure_alert (non-fatal): {e}")
 
 
 def _firm_local_hhmm(now_utc: datetime, tz_name: str) -> str:
@@ -102,9 +165,11 @@ def main():
             headers=SB_HEADERS,
             params={
                 "morning_briefing_enabled": "eq.true",
-                # `firms(timezone)` is PostgREST embedded select via the FK
-                # from firm_preferences.firm_id -> firms.id.
-                "select": "firm_id,morning_briefing_time,firms(timezone)",
+                # `firms(...)` is PostgREST embedded select via the FK
+                # from firm_preferences.firm_id -> firms.id. We pull
+                # display_name alongside timezone so the alert email (when
+                # an SMS fails) can identify the firm by name.
+                "select": "firm_id,morning_briefing_time,firms(timezone,display_name)",
             },
             timeout=10,
         )
@@ -177,6 +242,24 @@ def main():
                 f"generated={result.get('generated')} "
                 f"reason={result.get('reason')}"
             )
+
+            # 4. Alert on silent SMS failure. We only fire when the plugin
+            #    ACTUALLY tried to send (generated=true) and Telnyx came
+            #    back unhappy (sent_sms=false). Idempotency-skip cases
+            #    (generated=false) don't trigger the alert because there
+            #    was no send attempt to fail. No deduplication needed —
+            #    the scheduler can only reach this branch once per firm
+            #    per UTC day (the morning_briefings idempotency check at
+            #    step 2 blocks any second attempt).
+            if result.get("generated") and not result.get("sent_sms"):
+                firm_obj = row.get("firms") or {}
+                firm_name = firm_obj.get("display_name") or "Unknown firm"
+                _send_briefing_failure_alert(
+                    firm_id=firm_id,
+                    firm_name=firm_name,
+                    briefing_id=result.get("briefing_id") or "",
+                    today_iso=today_iso,
+                )
         except Exception as e:
             log.error(f"Firm {firm_id[:8]} ({tz_name}): error - {e}")
             # Continue to the next firm; one bad firm shouldn't fail the tick.
