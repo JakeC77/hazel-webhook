@@ -4949,8 +4949,13 @@ def api_messages_post():
     attachments = body.get("attachments") or []
     if not content and not attachments:
         return jsonify({"error": "content or attachments required"}), 400
+    # channel labels the surface (Trello w9M9TjXp persistence layer). Builder
+    # dashboard messages are project-scoped when a project_id is present,
+    # otherwise they're firm-level portfolio chat. Matches the backfill logic
+    # in migration 035 so new rows stay consistent with old ones.
     insert = {"firm_id": firm_id, "role": "builder",
-              "content": content, "attachments": attachments}
+              "content": content, "attachments": attachments,
+              "channel": "dashboard-project" if project_id else "dashboard-portfolio"}
     if project_id:
         insert["project_id"] = project_id
     try:
