@@ -698,15 +698,26 @@ def api_project_contacts_unassign(project_id, contact_id):
 @app.route("/api/projects", methods=["GET"])
 @require_auth
 def api_projects_get():
-    """Return all projects for the caller's firm (service role — bypasses RLS)."""
+    """Return projects for the caller's firm (service role — bypasses RLS).
+
+    Archived projects (Trello rtiCPsTC) are excluded by default so the
+    dashboard's active views stay clean. Pass ?include_archived=true to get
+    every project regardless of archive status — used by the dashboard's
+    own load (it renders archived ones in a separate collapsed section) and
+    by any caller that needs the full set for context/intelligence.
+    """
     firm_id = g.firm_id
     if not firm_id:
         return jsonify({"error": "No firm found for this user"}), 404
+    include_archived = request.args.get("include_archived", "false").lower() == "true"
     try:
+        params = {"firm_id": f"eq.{firm_id}", "select": "*", "order": "created_at.asc"}
+        if not include_archived:
+            params["archived"] = "eq.false"
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/projects",
             headers={**SB_HEADERS, "Content-Type": "application/json"},
-            params={"firm_id": f"eq.{firm_id}", "select": "*", "order": "created_at.asc"},
+            params=params,
             timeout=5,
         )
         r.raise_for_status()
@@ -748,7 +759,8 @@ def api_projects_portfolio():
         # 1. Active projects for this firm
         pr = sb("projects", {
             "firm_id": f"eq.{firm_id}",
-            "status": "neq.archived",
+            "status": "neq.archived",   # legacy status convention (kept for back-compat)
+            "archived": "eq.false",     # dedicated archive flag (Trello rtiCPsTC)
             "select": "id,name,client_name,status,contract_value",
             "order": "created_at.asc",
         })
