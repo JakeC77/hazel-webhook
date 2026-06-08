@@ -5974,5 +5974,232 @@ def api_detect_risks():
     return jsonify(summary), 200
 
 
+@app.route("/api/sms/approve/<queue_item_id>", methods=["POST"])
+@require_auth
+def api_sms_approve(queue_item_id):
+    """Approve an SMS draft AND dispatch via the plugin in one atomic step.
+
+    Flow (docs/sms-safety-hardening-spec.md §6):
+      1. Verify the queue_item belongs to the caller's firm, is type=sms,
+         and is currently 'active'.
+      2. Find the linked pending_outbound_sms row via queue_item_id.
+      3. Mark BOTH rows approved (queue_items.status='approved',
+         pending.status='approved', approved_via='dashboard',
+         approved_body=optional from request body).
+      4. POST to plugin's /hazel/internal/dispatch-approved-sms.
+      5. Surface the plugin's result.
+
+    Request body (optional):
+      { "body": "<replacement text>" }   — if owner edited before approve
+
+    Returns:
+      200 { dispatched: true,  telnyx_message_id: "...", short_ref: "..." }
+      200 { dispatched: false, error: "Telnyx failed (...)", short_ref: "..." }
+      4xx { error: "..." }   — auth/scope/state errors
+    """
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+
+    # Optional replacement body from the edit-before-approve flow.
+    body_override = None
+    try:
+        payload = request.get_json(silent=True) or {}
+        body_override = (payload.get("body") or "").strip() or None
+    except Exception:
+        body_override = None
+
+    try:
+        # 1. Fetch + verify the queue_item.
+        qr = requests.get(
+            f"{SUPABASE_URL}/rest/v1/queue_items",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={
+                "id": f"eq.{queue_item_id}",
+                "firm_id": f"eq.{firm_id}",
+                "type": "eq.sms",
+                "select": "id,status,firm_id,project_id,current_draft",
+                "limit": "1",
+            },
+            timeout=5,
+        )
+        qr.raise_for_status()
+        qrows = qr.json()
+        if not qrows:
+            return jsonify({"error": "queue item not found, not yours, or not type=sms"}), 404
+        qitem = qrows[0]
+        if qitem["status"] not in ("active", "approved"):
+            return jsonify({
+                "error": f"queue item is '{qitem['status']}', cannot approve"
+            }), 409
+
+        # 2. Find the linked pending_outbound_sms row.
+        pr = requests.get(
+            f"{SUPABASE_URL}/rest/v1/pending_outbound_sms",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={
+                "queue_item_id": f"eq.{queue_item_id}",
+                "firm_id": f"eq.{firm_id}",
+                "select": "id,status,short_ref,to_phone,body,expires_at",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+            timeout=5,
+        )
+        pr.raise_for_status()
+        prows = pr.json()
+        if not prows:
+            return jsonify({
+                "error": "no pending_outbound_sms row linked to this queue item"
+            }), 404
+        pending = prows[0]
+        if pending["status"] not in ("pending", "approved"):
+            return jsonify({
+                "error": f"pending row is '{pending['status']}', cannot dispatch"
+            }), 409
+        # Expiry check (client-side, the plugin re-checks too)
+        try:
+            from datetime import datetime, timezone
+            exp = datetime.fromisoformat(pending["expires_at"].replace("Z", "+00:00"))
+            if exp < datetime.now(timezone.utc):
+                return jsonify({"error": "pending row expired"}), 410
+        except Exception:
+            pass  # if date parse fails, let the plugin reject it
+
+        # 3. Mark both rows approved. Update pending_outbound_sms with the
+        #    replacement body (if any) and the approver identity.
+        approved_at_iso = datetime.now(timezone.utc).isoformat()
+        approver_id = getattr(g, "user_id", None) or None
+
+        if qitem["status"] != "approved":
+            qu = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/queue_items",
+                headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+                params={"id": f"eq.{queue_item_id}"},
+                json={"status": "approved", "decided_at": approved_at_iso,
+                      "decided_by": approver_id or ""},
+                timeout=5,
+            )
+            if not qu.ok:
+                return jsonify({"error": f"failed to mark queue_item approved: {qu.status_code}"}), 500
+
+        if pending["status"] == "pending":
+            pu_body = {
+                "status": "approved",
+                "approved_at": approved_at_iso,
+                "approved_via": "dashboard",
+            }
+            if approver_id:
+                pu_body["approved_by"] = approver_id
+            if body_override:
+                pu_body["approved_body"] = body_override
+            pu = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/pending_outbound_sms",
+                headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+                params={"id": f"eq.{pending['id']}", "status": "eq.pending"},
+                json=pu_body,
+                timeout=5,
+            )
+            if not pu.ok:
+                return jsonify({"error": f"failed to mark pending approved: {pu.status_code}"}), 500
+
+        # 4. Tell the plugin to dispatch.
+        plugin_url = f"{OPENCLAW_URL}/hazel/internal/dispatch-approved-sms"
+        headers = {"Content-Type": "application/json"}
+        plugin_token = os.getenv("HAZEL_INTERNAL_TOKEN", "")
+        if plugin_token:
+            headers["X-Internal-Token"] = plugin_token
+        try:
+            dr = requests.post(
+                plugin_url,
+                headers=headers,
+                json={"pending_id": pending["id"]},
+                timeout=30,
+            )
+        except Exception as e:
+            return jsonify({
+                "dispatched": False,
+                "short_ref": pending["short_ref"],
+                "error": f"plugin unreachable: {e}",
+            }), 502
+        if not dr.ok:
+            return jsonify({
+                "dispatched": False,
+                "short_ref": pending["short_ref"],
+                "error": f"plugin returned {dr.status_code}: {dr.text[:200]}",
+            }), 502
+        result = dr.json() or {}
+        return jsonify({
+            "dispatched": bool(result.get("dispatched")),
+            "telnyx_message_id": result.get("telnyx_message_id"),
+            "short_ref": pending["short_ref"],
+            "error": result.get("error"),
+        }), 200
+    except Exception as e:
+        logging.error(f"api_sms_approve({queue_item_id}): {e}")
+        return jsonify({"error": "internal error"}), 500
+
+
+@app.route("/api/sms/reject/<queue_item_id>", methods=["POST"])
+@require_auth
+def api_sms_reject(queue_item_id):
+    """Reject an SMS draft. Marks both queue_items.status='rejected' AND
+    pending_outbound_sms.status='rejected'. No dispatch happens — Hazel
+    never tells the recipient anything about a rejected draft (silent
+    per the spec)."""
+    firm_id = g.firm_id
+    if not firm_id:
+        return jsonify({"error": "No firm found for this user"}), 404
+
+    reason = None
+    try:
+        payload = request.get_json(silent=True) or {}
+        reason = (payload.get("reason") or "").strip() or "rejected_via_dashboard"
+    except Exception:
+        reason = "rejected_via_dashboard"
+
+    try:
+        # Verify ownership + type.
+        qr = requests.get(
+            f"{SUPABASE_URL}/rest/v1/queue_items",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            params={
+                "id": f"eq.{queue_item_id}",
+                "firm_id": f"eq.{firm_id}",
+                "type": "eq.sms",
+                "select": "id,status",
+                "limit": "1",
+            },
+            timeout=5,
+        )
+        qr.raise_for_status()
+        if not qr.json():
+            return jsonify({"error": "queue item not found, not yours, or not type=sms"}), 404
+
+        # Patch both rows. queue_items.status='rejected' uses the existing
+        # decided_at convention.
+        approved_at_iso = datetime.now(timezone.utc).isoformat()
+        approver_id = getattr(g, "user_id", None) or None
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/queue_items",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            params={"id": f"eq.{queue_item_id}"},
+            json={"status": "rejected", "decided_at": approved_at_iso,
+                  "decided_by": approver_id or ""},
+            timeout=5,
+        )
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/pending_outbound_sms",
+            headers={**SB_HEADERS, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            params={"queue_item_id": f"eq.{queue_item_id}", "status": "eq.pending"},
+            json={"status": "rejected", "rejected_reason": reason},
+            timeout=5,
+        )
+        return jsonify({"rejected": True}), 200
+    except Exception as e:
+        logging.error(f"api_sms_reject({queue_item_id}): {e}")
+        return jsonify({"error": "internal error"}), 500
+
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8700, threaded=True)
