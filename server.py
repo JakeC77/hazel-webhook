@@ -1303,7 +1303,11 @@ def _send_welcome_email(firm: dict, user_id: str):
             f"Hello {first_name}, welcome to Hazel! Here is some information to help you get started.\n\n"
             "- You can text Hazel at: 1 (888) 281-2061\n"
             "- Your dashboard login is here: https://hazel.haventechsolutions.com/\n"
-            "- Contact support@hazel.build if you need any help\n\n"
+            "- Contact support@haventechsolutions.com if you need any help\n\n"
+            "Your First Project\n\n"
+            "The best way to get started with your first project is to ask Hazel "
+            "what she needs to know about it. The more information you give her "
+            "the more helpful she'll be.\n\n\n"
             "How To Communicate With Hazel\n\n"
             "Text Hazel as you would a person.\n\n"
             "- Punch lists: \"I'm finishing a walk-through at Cedar Hills. "
@@ -1773,10 +1777,20 @@ def api_invites():
             json={
                 "to": [email],
                 "subject": "You've been invited to Hazel",
-                "text": f"You've been invited to join a firm on Hazel.\n\nAccept your invite:\n{invite_url}\n\nThis link expires in 72 hours.",
+                "text": (
+                    f"You've been invited to join a firm on Hazel.\n\n"
+                    f"Accept your invite:\n{invite_url}\n\n"
+                    "This link expires in 72 hours.\n\n"
+                    "Once you're set up, you can reach Hazel any time by text or call at 1 (888) 281-2061. "
+                    "You can also log in to your dashboard at https://hazel.haventechsolutions.com/\n\n"
+                    "Questions? Contact support@haventechsolutions.com"
+                ),
                 "html": f"""<p>You've been invited to join a firm on <strong>Hazel</strong>.</p>
 <p><a href="{invite_url}" style="background:#1e3a5f;color:white;padding:10px 20px;text-decoration:none;border-radius:6px;display:inline-block;margin:8px 0;">Accept Invite</a></p>
-<p style="color:#666;font-size:13px;">This link expires in 72 hours. If you didn't expect this, ignore this email.</p>""",
+<p>This link expires in 72 hours.</p>
+<p>Once you're set up, you can reach Hazel any time by text or call at <strong>1 (888) 281-2061</strong>. You can also log in to your dashboard at <a href="https://hazel.haventechsolutions.com/">hazel.haventechsolutions.com</a>.</p>
+<p>Questions? Contact <a href="mailto:support@haventechsolutions.com">support@haventechsolutions.com</a></p>
+<p style="color:#666;font-size:13px;">If you didn't expect this invite, you can ignore this email.</p>""",
             },
             timeout=10,
         )
